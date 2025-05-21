@@ -172,12 +172,15 @@ if "styled_cloudtrail_df" in st.session_state:
     st.dataframe(st.session_state["styled_cloudtrail_df"], use_container_width=True)
 
 # ----------------- AI DIAGNOSIS REPORT -----------------
-with st.expander("🧠 AI Diagnosis Report (Beta)"):
+with st.expander("🧠 AI Diagnosis Report (Beta)", expanded=st.session_state.get("ai_expander_open", True)):
     if "cloudtrail_df" not in st.session_state:
         st.warning("Please fetch CloudTrail logs first.")
     else:
-        policy_text = st.text_area("Paste Lab IAM Policy (JSON or text format)", height=150)
-        user_feedback = st.text_area("Describe any issues encountered during the lab")
+        policy_text = st.text_area("Paste Lab IAM Policy (JSON or text format)", height=150, key="policy_text")
+        user_feedback = st.text_area("Describe any issues encountered during the lab", key="user_feedback")
+
+        if policy_text or user_feedback:
+            st.session_state["ai_expander_open"] = True
 
         if st.button("Generate Report from Log Data"):
             with st.spinner("Analyzing logs with GPT..."):
