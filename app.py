@@ -173,6 +173,7 @@ if "styled_cloudtrail_df" in st.session_state:
 
 # ----------------- AI DIAGNOSIS REPORT -----------------
 with st.expander("🧠 AI Diagnosis Report (Beta)", expanded=st.session_state.get("ai_expander_open", True)):
+    print('hello')
     if "cloudtrail_df" not in st.session_state:
         st.warning("Please fetch CloudTrail logs first.")
     else:
@@ -238,3 +239,6 @@ with st.expander("🧠 AI Diagnosis Report (Beta)", expanded=st.session_state.ge
                             for content in item.content:
                                 if content.type == "output_text":
                                     st.markdown(content.text)
+
+
+
