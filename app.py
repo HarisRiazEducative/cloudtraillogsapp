@@ -35,11 +35,27 @@ else:
     user_id = st.text_input("User ID", placeholder="e.g. 4930460945350656")
     attempt_id = st.text_input("Attempt ID", placeholder="e.g. 1")
     region = st.text_input("Region", value="us-east-1")
+
     if lab_url and user_id and attempt_id:
+        # Match and convert editor or normal cloudlab URLs to API format
+        match_editor = re.match(
+            r"https://www\.educative\.io/editor/collection/page/(\d+)/(\d+)/(\d+)/cloudlab", lab_url
+        )
+        match_collection = re.match(
+            r"https://www\.educative\.io/collection/page/(\d+)/(\d+)/(\d+)/cloudlab", lab_url
+        )
+        
+        if match_editor or match_collection:
+            author_id, collection_id, cloud_lab_id = (match_editor or match_collection).groups()
+            lab_url = f"https://www.educative.io/api/cloud-lab/{author_id}/{collection_id}/{cloud_lab_id}"
+
+        # Construct the API URL
         api_url = f"{lab_url}/events?user_id={user_id}&attempt_id={attempt_id}&region={region}"
-        match = re.match(r".*/cloud-lab/(\d+)/(\d+)/(\d+)", lab_url)
-        if match:
-            author_id, collection_id, cloud_lab_id = match.groups()
+
+        # Extract identifiers for further use if needed
+        match_api = re.match(r".*/cloud-lab/(\d+)/(\d+)/(\d+)", lab_url)
+        if match_api:
+            author_id, collection_id, cloud_lab_id = match_api.groups()
 
 # ----------------- DEFAULT COOKIE (used by default) -----------------
 DEFAULT_COOKIE_HEADER = json.loads(st.secrets["auth"]["default_cookie_header"])
@@ -160,6 +176,9 @@ with st.expander("🧠 AI Diagnosis Report (Beta)"):
     if "cloudtrail_df" not in st.session_state:
         st.warning("Please fetch CloudTrail logs first.")
     else:
+        policy_text = st.text_area("Paste Lab IAM Policy (JSON or text format)", height=150)
+        user_feedback = st.text_area("Describe any issues encountered during the lab")
+
         if st.button("Generate Report from Log Data"):
             with st.spinner("Analyzing logs with GPT..."):
                 df = st.session_state["cloudtrail_df"]
@@ -174,24 +193,45 @@ with st.expander("🧠 AI Diagnosis Report (Beta)"):
                     st.info("No failure logs found to analyze.")
                 else:
                     error_summary = failure_df[["Time", "Name", "Error Code", "Error Message"]].to_string(index=False)
-                    prompt = f"""
-You are an AWS Cloud expert. The following are logs from AWS CloudTrail for a Cloud Lab that failed during deployment:
 
-{error_summary}
+                    input_data = [
+                        {
+                            "role": "system",
+                            "content": """ 
+                            You are an AWS troubleshooting assistant analyzing CloudTrail logs, IAM policies, and user feedback to diagnose IAM-related lab failures. Your job is to:
 
-Please write a short diagnostic report explaining:
-- What might have gone wrong
-- The most common errors
-- Any misconfigurations or permissions issues
-- Suggested actions to fix these problems
-"""
+                            - Identify failed IAM actions from CloudTrail logs
+                            - Compare them against the permissions allowed in the IAM policy
+                            - Generate a professional, structured report including:
+                                • Summary of Failures
+                                • Root Cause Analysis
+                                • Missing Permissions (in a table, if appropriate)
+                                • Recommended Policy Adjustments
+                                • Next Steps
+                            - Distinguish between critical and non-critical (background) denied actions
+
+                            The output should be in markdown format, written professionally and suitable for sharing with a user or team reviewing lab results.
+
+                            """
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Here are failure logs from the CloudTrail lab session:\n```{error_summary}```\n\nHere is the IAM policy applied in the lab:\n```{policy_text}```\n\nThe user reported these issues during execution:\n```{user_feedback}```\n\nBased on the logs, IAM scope, and user feedback, explain:\n- What likely failed and why\n- Whether adjusting permissions might resolve it\n- Or if the lab should be retested manually. Provide specific missing permissions if identifiable."
+                        }
+                    ]
+
                     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-                    response = client.chat.completions.create(
-                        model="gpt-4.1-nano",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.3,
-                        max_tokens=32768,
+                    response = client.responses.create(
+                        model="o4-mini",
+                        input=input_data,
+                        text={"format": {"type": "text"}},
+                        reasoning={"effort": "medium"},
+                        tools=[],
+                        store=True
                     )
-                    report = response.choices[0].message.content
                     st.markdown("### 📋 Suggested Diagnosis")
-                    st.markdown(report)
+                    for item in response.output:
+                        if item.type == "message":
+                            for content in item.content:
+                                if content.type == "output_text":
+                                    st.markdown(content.text)
