@@ -31,6 +31,31 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 from collections import defaultdict
 
+# --- NLTK bootstrap (must be before any llama_index imports) ---
+import os
+import nltk
+
+# choose a writable dir on Streamlit Cloud
+NLTK_DIR = os.path.join(os.path.expanduser("~"), ".cache", "nltk")
+os.makedirs(NLTK_DIR, exist_ok=True)
+
+# Ensure NLTK searches this path first
+if NLTK_DIR not in nltk.data.path:
+    nltk.data.path.insert(0, NLTK_DIR)
+
+# Make sure required packages exist; download only if missing
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt", download_dir=NLTK_DIR)
+
+try:
+    nltk.data.find("corpora/stopwords")
+except LookupError:
+    nltk.download("stopwords", download_dir=NLTK_DIR)
+# --- end NLTK bootstrap ---
+
+
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, ServiceContext, Document
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.embeddings.openai import OpenAIEmbedding
@@ -1767,11 +1792,14 @@ def generate_resource_config_section(*, bucket: str, s3, lab_name: str):
     if not logs_key:
         logs_key = _pick_latest_logs_key(bucket, s3, lab_name)
 
-    include_logs = st.checkbox("Include execution logs to enrich extraction (recommended)", value=bool(logs_key))
+    include_logs= False
+    max_chars= False
 
-    with st.expander("Advanced: context limits", expanded=False):
-        max_chars = st.number_input("Max context characters (0 = full file)", min_value=0, value=0, step=100000,
-                                    help="Set to 0 to pass the entire content file.")
+    # include_logs = st.checkbox("Include execution logs to enrich extraction (recommended)", value=bool(logs_key))
+
+    # with st.expander("Advanced: context limits", expanded=False):
+    #     max_chars = st.number_input("Max context characters (0 = full file)", min_value=0, value=0, step=100000,
+    #                                 help="Set to 0 to pass the entire content file.")
 
     question = "Extract all AWS resources the learner creates/configures in this lab and their configurations as JSON."
     run = st.button("Generate & Save Resource Config JSON", type="primary", key=f"gen_rc_{lab_name}")
@@ -1804,7 +1832,7 @@ def generate_resource_config_section(*, bucket: str, s3, lab_name: str):
                     logs_text = logs_bytes.decode("utf-8", errors="replace")[:8000]
                 content_text += "\n\nExecution logs (truncated):\n" + logs_text
 
-        if max_chars and max_chars > 0:
+        if max_chars:
             context = content_text[:max_chars]
         else:
             context = content_text
