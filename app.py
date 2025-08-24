@@ -55,6 +55,15 @@ except LookupError:
     nltk.download("stopwords", download_dir=NLTK_DIR)
 # --- end NLTK bootstrap ---
 
+import sys
+try:
+    __import__("pysqlite3")                 # loads the wheel with modern SQLite
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except Exception:
+    # If the wheel isn't present, Chroma will try its own fallback and raise
+    # the same error; this keeps local dev working if you already have new sqlite.
+    pass
+
 
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, ServiceContext, Document
 from llama_index.vector_stores.chroma import ChromaVectorStore
