@@ -13,6 +13,7 @@ botocore>=1.31
 
 # ── OpenAI + LlamaIndex (the code imports from llama_index.core, v0.10+) ──────
 openai>=1.40.0
+pysqlite3-binary==0.5.2.post3
 
 llama-index-core>=0.10.59,<0.11
 llama-index-embeddings-openai>=0.1.11
@@ -22,6 +23,7 @@ llama-index-vector-stores-chroma>=0.1.10
 # ChromaDB pinned to a stable series compatible with the above adapters
 chromadb==0.4.24
 
+
 # Hugging Face local embedding fallback
 sentence-transformers>=2.6.1
 # Torch is required by sentence-transformers; CPU wheels are fine on Streamlit Cloud
@@ -29,6 +31,7 @@ torch>=2.1.0
 
 # ── Gemini (you still call google.generativeai for some paths) ─────────────────
 google-generativeai>=0.7.2
+
 
 # ── Optional: Playwright (headless browser extraction) ─────────────────────────
 # If you plan to use the Playwright path in Streamlit Cloud, keep this.
