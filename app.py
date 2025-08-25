@@ -16,6 +16,8 @@ Features:
 - S3-based file management and viewing
 """
 
+
+
 from __future__ import annotations
 
 import io
@@ -77,6 +79,14 @@ from bs4 import BeautifulSoup, Tag
 from urllib.parse import urlparse, urljoin, quote_plus
 
 import streamlit as st
+
+@st.cache_resource(show_spinner=False)
+def ensure_chromium_installed():
+    """Download Playwright Chromium browser if missing (idempotent)."""
+    # Put browsers in a writable, cached location
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright"))
+    # This command is safe to run repeatedly; it will no-op if already installed
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
 # --- Google Gemini
 try:
     import google.generativeai as genai
@@ -1996,6 +2006,7 @@ def lab_extractor_module():
     # Prefer Playwright for Educative pages
     if edu_mode and use_playwright:
         try:
+            ensure_chromium_installed()
             with st.status("Rendering & extracting via Playwright...", expanded=debug) as status:
                 try:
                     import subprocess, sys
