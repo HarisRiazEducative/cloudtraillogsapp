@@ -665,7 +665,7 @@ def display_log_details(organized_logs):
 # -----------------------------
 async def analyze_lab_with_gemini(organized_logs, lab_spec_content):
     """Analyze lab issues using Gemini AI with failure logs."""
-    st.info("Sending data to Gemini for analysis...")
+    st.info("Sending data to Model for analysis...")
     try:
         if "openaikey" not in st.secrets:
             st.error("OpenAI API key not found.")
@@ -745,7 +745,7 @@ CloudTrail Error Events Summary:
         # else:
         #     st.warning("No response from Gemini.")
     except Exception as e:
-        st.error(f"Gemini API error: {e}")
+        st.error(f"API error: {e}")
 
 
 async def analyze_resource_creation(organized_logs, lab_spec_content):
@@ -760,7 +760,7 @@ async def analyze_resource_creation(organized_logs, lab_spec_content):
         model = "gpt-4.1"
 
         creation_logs = {
-            source: [event for event in events if any(x in event.get("event_name", "") for x in ("Create", "Authorize"))]
+            source: [event for event in events if any(x in event.get("event_name", "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach"))]
             for source, events in organized_logs.items()
         }
 
@@ -844,7 +844,7 @@ Please provide your analysis in the following format:
         # else:
         #     st.warning("No response from Gemini.")
     except Exception as e:
-        st.error(f"Gemini API error: {e}")
+        st.error(f"API error: {e}")
 
 def cloudtrail_analysis_module():
     """Main CloudTrail analysis module with S3 file selection and AI analysis."""
@@ -1014,8 +1014,8 @@ def cloudtrail_analysis_module():
         elif selected_tab == "Detailed Logs":
             display_log_details(st.session_state.cloudtrail_organized_logs)
             
-        elif selected_tab == "Lab Analysis":
-            st.markdown("### 🔍 Analyze Lab-Specific Issues")
+        elif selected_tab == "Lab Errors Analysis":
+            st.markdown("### 🔍 Analyze Errors in the labs")
             if st.session_state.cloudtrail_lab_spec_content:
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1027,12 +1027,12 @@ def cloudtrail_analysis_module():
                                 if "429" in str(e):
                                     st.error("⚠️ Gemini API quota exceeded. Please wait a moment and try again, or check your API usage limits.")
                                 else:
-                                    st.error(f"Gemini API error: {e}")
+                                    st.error(f"API error: {e}")
             else:
                 st.info("Please select or upload a resource config file to enable lab analysis.")
 
             if "gemini_lab_analysis" in st.session_state:
-                st.markdown("### 🔍 Gemini Analysis Results")
+                st.markdown("### 🔍 Analysis Results")
                 st.markdown(st.session_state["gemini_lab_analysis"])
                 
         elif selected_tab == "Resource Compliance":
@@ -2563,7 +2563,7 @@ def feedback_analysis_module():
         for source, events in organized_logs.items():
             if any(x in (source or "").lower() for x in skip_sources_creation):
                 continue
-            creates = [e for e in events if any(x in (e.get("event_name") or "") for x in ("Create", "Authorize"))]
+            creates = [e for e in events if any(x in (e.get("event_name") or "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach"))]
             if creates:
                 creation_logs[source] = creates
 
