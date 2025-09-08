@@ -990,7 +990,7 @@ def cloudtrail_analysis_module():
         st.success("Logs processed successfully!")
         
         # Create tabs with state management
-        tab_names = ["Summary", "Detailed Logs", "Lab Analysis", "Resource Compliance"]
+        tab_names = ["Summary", "Detailed Logs", "Errors Analysis in Lab", "Resource Compliance"]
         
         st.markdown("### Analysis Options")
         # Use radio buttons to maintain tab state
@@ -1014,7 +1014,7 @@ def cloudtrail_analysis_module():
         elif selected_tab == "Detailed Logs":
             display_log_details(st.session_state.cloudtrail_organized_logs)
             
-        elif selected_tab == "Lab Errors Analysis":
+        elif selected_tab == "Errors Analysis in Lab":
             st.markdown("### 🔍 Analyze Errors in the labs")
             if st.session_state.cloudtrail_lab_spec_content:
                 col1, col2 = st.columns(2)
