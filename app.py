@@ -1020,6 +1020,7 @@ def cloudtrail_analysis_module():
                 col1, col2 = st.columns(2)
                 with col1:
                     if st.button("Analyze Lab Issues", key="analyze_lab_btn"):
+                        st.session_state.pop("gemini_lab_analysis", None)
                         if "gemini_lab_analysis" not in st.session_state:
                             try:
                                 asyncio.run(analyze_lab_with_gemini(st.session_state.cloudtrail_organized_logs, st.session_state.cloudtrail_lab_spec_content))
@@ -1039,14 +1040,15 @@ def cloudtrail_analysis_module():
             st.markdown("### 🛠 Resource Creation Analysis")
             if st.session_state.cloudtrail_lab_spec_content:
                 if st.button("Check Resource Creation Compliance", key="analyze_compliance_btn"):
+                    st.session_state.pop("gemini_resource_analysis", None)
                     if "gemini_resource_analysis" not in st.session_state:
                         try:
                             asyncio.run(analyze_resource_creation(st.session_state.cloudtrail_organized_logs, st.session_state.cloudtrail_lab_spec_content))
                         except Exception as e:
                             if "429" in str(e):
-                                st.error("⚠️ Gemini API quota exceeded. Please wait a moment and try again, or check your API usage limits.")
+                                st.error("⚠️ API quota exceeded. Please wait a moment and try again, or check your API usage limits.")
                             else:
-                                st.error(f"Gemini API error: {e}")
+                                st.error(f"API error: {e}")
                 if "gemini_resource_analysis" in st.session_state:
                     st.markdown(st.session_state["gemini_resource_analysis"])
             else:
