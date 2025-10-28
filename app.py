@@ -760,7 +760,7 @@ async def analyze_resource_creation(organized_logs, lab_spec_content):
         model = "gpt-4.1"
 
         creation_logs = {
-            source: [event for event in events if any(x in event.get("event_name", "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach"))]
+            source: [event for event in events if any(x in event.get("event_name", "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach", "Update"))]
             for source, events in organized_logs.items()
         }
 
@@ -2565,7 +2565,7 @@ def feedback_analysis_module():
         for source, events in organized_logs.items():
             if any(x in (source or "").lower() for x in skip_sources_creation):
                 continue
-            creates = [e for e in events if any(x in (e.get("event_name") or "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach"))]
+            creates = [e for e in events if any(x in (e.get("event_name") or "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach", "Update"))]
             if creates:
                 creation_logs[source] = creates
 
