@@ -220,6 +220,120 @@ def sanitize_lab_name(name: str) -> str:
     name = re.sub(r"\s+", "_", name)  # collapse spaces
     return name or "lab"
 
+# -----------------------------
+# DynamoDB helpers
+# Table: CloudLabsFeedbackTable
+# Partition key (PK): lab_id  e.g. "10370001/4504598964207616/6319033399771136"
+# Additional attributes stored per item:
+#   lab_display_name  (str)  — human-readable name from [Task 1]
+#   lab_s3_name       (str)  — sanitized S3 key prefix
+#   root_url          (str)  — canonical editor URL
+#   extracted_at      (str)  — ISO-8601 timestamp of last extraction
+# -----------------------------
+DYNAMO_TABLE = "CloudLabsFeedbackTable"
+
+@st.cache_resource(show_spinner=False)
+def get_dynamodb():
+    """Return a boto3 DynamoDB resource using the same AWS credentials as S3."""
+    if boto3 is None:
+        return None
+    aws = st.secrets.get("aws", {})
+    region = aws.get("region") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+    access_key = aws.get("access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = aws.get("secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    session_token = aws.get("session_token") or os.getenv("AWS_SESSION_TOKEN")
+    if access_key and secret_key:
+        session = boto3.session.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            aws_session_token=session_token,
+            region_name=region,
+        )
+    else:
+        session = boto3.session.Session(region_name=region)
+    return session.resource("dynamodb")
+
+
+def _lab_id_from_url(url: str) -> Optional[str]:
+    """
+    Extract the canonical lab ID "id1/id2/id3" from any Educative URL.
+    Works for both published and editor link formats.
+    """
+    ids = parse_editor_ids(url or "")
+    if ids:
+        return "/".join(ids)
+    return None
+
+
+def dynamo_get_lab(lab_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a lab record from DynamoDB by its lab_id.
+    Returns the item dict, or None if not found / DynamoDB unavailable.
+    """
+    try:
+        ddb = get_dynamodb()
+        if ddb is None:
+            return None
+        table = ddb.Table(DYNAMO_TABLE)
+        resp = table.get_item(Key={"lab_id": lab_id})
+        return resp.get("Item")
+    except Exception as e:
+        print(f"[DynamoDB] get_lab error: {e}")
+        return None
+
+
+def dynamo_put_lab(lab_id: str, lab_display_name: str, lab_s3_name: str, root_url: str):
+    """
+    Insert or overwrite a lab record in DynamoDB.
+    Always updates extracted_at to now.
+    """
+    try:
+        ddb = get_dynamodb()
+        if ddb is None:
+            return
+        table = ddb.Table(DYNAMO_TABLE)
+        table.put_item(Item={
+            "lab_id":           lab_id,
+            "lab_display_name": lab_display_name,
+            "lab_s3_name":      lab_s3_name,
+            "root_url":         root_url,
+            "extracted_at":     datetime.utcnow().isoformat() + "Z",
+        })
+    except Exception as e:
+        print(f"[DynamoDB] put_lab error: {e}")
+
+
+def dynamo_lab_exists(lab_id: str) -> bool:
+    """Return True if a record for lab_id exists in DynamoDB."""
+    return dynamo_get_lab(lab_id) is not None
+
+# -----------------------------
+# Report persistence helpers
+# Reports are stored in S3 under:
+#   analysis_reports/<lab_s3_name>_<user_id>_<attempt_id>_error_analysis.md
+#   analysis_reports/<lab_s3_name>_<user_id>_<attempt_id>_compliance.md
+# -----------------------------
+def _report_key(lab_name: str, user_id: str, attempt_id: str, report_type: str,
+                iam_username: str = "") -> str:
+    """Build the S3 key for a saved analysis report."""
+    lab = sanitize_lab_name(lab_name)
+    uid = (user_id    or "unknown").strip()
+    aid = (attempt_id or "unknown").strip()
+    iam_suffix = f"_iam_{iam_username.strip()}" if (iam_username or "").strip() else ""
+    return f"analysis_reports/{lab}_{uid}_{aid}{iam_suffix}_{report_type}.md"
+
+def save_report_to_s3(s3, bucket: str, key: str, text: str):
+    """Save a markdown report string to S3."""
+    try:
+        s3_put_text(s3, bucket, key, text, "text/markdown")
+    except Exception as e:
+        print(f"[report] save failed {key}: {e}")
+
+def load_report_from_s3(s3, bucket: str, key: str) -> Optional[str]:
+    """Load a markdown report from S3. Returns None if not found."""
+    data = s3_get_bytes(s3, bucket, key)
+    return data.decode("utf-8", errors="replace") if data else None
+
 def chunk_logs(logs, chunk_size=1000):
     """Chunk logs for processing large files efficiently."""
     for i in range(0, len(logs), chunk_size):
@@ -847,7 +961,7 @@ Please provide your analysis in the following format:
         st.error(f"API error: {e}")
 
 def cloudtrail_analysis_module():
-    """Main CloudTrail analysis module with S3 file selection and AI analysis."""
+    """Main CloudTrail analysis module — auto-uses data loaded by the auto-flow above."""
     # Initialize session state for persistent data FIRST
     if "cloudtrail_organized_logs" not in st.session_state:
         st.session_state.cloudtrail_organized_logs = None
@@ -859,117 +973,87 @@ def cloudtrail_analysis_module():
         st.session_state.cloudtrail_selected_config_file = None
     if "cloudtrail_active_tab" not in st.session_state:
         st.session_state.cloudtrail_active_tab = "Summary"
-    
+
     st.header("CloudTrail Log Analyzer")
-    st.caption("Select CloudTrail logs from S3 and analyze with AI-powered insights")
-    
+
     # Get S3 connection
     bucket, s3 = get_s3()
     if not bucket or not s3:
         st.error("Missing S3 setup. Add [aws] bucket/region/credentials to secrets.toml.")
         return
-    
-    # File source selection
-    file_source = st.radio(
-        "Choose file source",
-        options=["Select from S3", "Upload from device"],
-        horizontal=True,
-        help="Select files from S3 bucket or upload from your device",
-        key="cloudtrail_file_source"
-    )
-    
-    if file_source == "Select from S3":
-        # S3 file selection for CloudTrail logs
-        st.subheader("Select CloudTrail Logs from S3")
-        execution_logs = s3_list_keys(bucket, s3, "execution_logs/")
-        if not execution_logs:
-            st.info("No execution logs found in S3. Please extract some labs first or upload files from device.")
-            return
-            
-        log_files = [item["Key"] for item in execution_logs]
-        selected_log_file = st.selectbox("Select CloudTrail log file", options=log_files, key="s3_log_select")
-        
-        # Load logs button
-        if selected_log_file and st.button("Load and Process Logs", key="load_logs_btn"):
-            with st.spinner("Loading logs from S3..."):
-                log_data = s3_get_bytes(s3, bucket, selected_log_file)
-                if log_data:
-                    # Store the raw log content in session state
-                    st.session_state['log_content'] = log_data.decode('utf-8')
-                    
-                    # Create a mock uploaded file object
-                    class MockUploadedFile:
-                        def __init__(self, data):
-                            self.data = data
-                            self.size = len(data)
-                            self.position = 0
-                        
-                        def read(self, size=None):
-                            if size is None:
-                                # Read all remaining data
-                                remaining = self.data[self.position:]
-                                self.position = len(self.data)
-                                return remaining
-                            else:
-                                # Read specific size
-                                end_pos = min(self.position + size, len(self.data))
-                                chunk = self.data[self.position:end_pos]
-                                self.position = end_pos
-                                return chunk
-                        
-                        def seek(self, pos):
-                            self.position = pos
-                    
-                    mock_file = MockUploadedFile(log_data)
-                    st.session_state.cloudtrail_organized_logs = load_and_process_logs(mock_file)
-                    st.session_state.cloudtrail_selected_log_file = selected_log_file
-                    st.success(f"Loaded logs from s3://{bucket}/{selected_log_file}")
+
+    # If the auto-flow already populated logs, show them directly — no manual selection needed
+    if st.session_state.cloudtrail_organized_logs and st.session_state.cloudtrail_lab_spec_content:
+        # Data already loaded — skip straight to analysis tabs below
+        pass
+    else:
+        # Fallback manual selection (for power users / re-analysis without going through the flow again)
+        with st.expander("📂 Manually load files from S3 or upload (optional)", expanded=not bool(st.session_state.cloudtrail_organized_logs)):
+            file_source = st.radio(
+                "File source",
+                options=["Select from S3", "Upload from device"],
+                horizontal=True,
+                key="cloudtrail_file_source"
+            )
+
+            if file_source == "Select from S3":
+                execution_logs = s3_list_keys(bucket, s3, "execution_logs/")
+                if execution_logs:
+                    log_files = [item["Key"] for item in execution_logs]
+                    selected_log_file = st.selectbox("CloudTrail log file", options=log_files, key="s3_log_select")
                 else:
-                    st.error("Failed to load log file from S3")
-        
-        # S3 file selection for resource config
-        st.subheader("Select Resource Config from S3")
-        resource_configs = s3_list_keys(bucket, s3, "resource_configs/")
-        if resource_configs:
-            config_files = [item["Key"] for item in resource_configs]
-            selected_config_file = st.selectbox("Select resource config file", options=config_files, key="s3_config_select")
-            
-            # Load config button
-            if selected_config_file and st.button("Load Resource Config", key="load_config_btn"):
-                config_data = s3_get_bytes(s3, bucket, selected_config_file)
-                if config_data:
-                    # Load the lab content based on lab name from selected config file
-                    lab_name = selected_config_file.split('/')[-1].replace('_resource_config.json', '')
-                    lab_content_key = f"content_docs/{lab_name}.txt"
-                    lab_content = s3_get_bytes(s3, bucket, lab_content_key)
-                    if lab_content:
-                        st.session_state['lab_content'] = lab_content.decode('utf-8', errors='replace')
-                
-                    # Store the config content
-                    st.session_state.cloudtrail_lab_spec_content = config_data.decode("utf-8", errors="replace")
-                    st.session_state.cloudtrail_selected_config_file = selected_config_file
-                    st.success(f"Loaded resource config from s3://{bucket}/{selected_config_file}")
-                    st.json(json.loads(st.session_state.cloudtrail_lab_spec_content))
+                    selected_log_file = None
+                    st.info("No execution logs found in S3.")
+
+                # Load logs button
+                if selected_log_file and st.button("Load and Process Logs", key="load_logs_btn"):
+                    with st.spinner("Loading logs from S3..."):
+                        log_data = s3_get_bytes(s3, bucket, selected_log_file)
+                        if log_data:
+                            st.session_state['log_content'] = log_data.decode('utf-8')
+                            class _MockFile2:
+                                def __init__(self, data): self.data = data; self.position = 0
+                                def read(self, size=None):
+                                    if size is None: chunk = self.data[self.position:]; self.position = len(self.data); return chunk
+                                    end_pos = min(self.position + size, len(self.data)); chunk = self.data[self.position:end_pos]; self.position = end_pos; return chunk
+                                def seek(self, pos): self.position = pos
+                            st.session_state.cloudtrail_organized_logs = load_and_process_logs(_MockFile2(log_data))
+                            st.session_state.cloudtrail_selected_log_file = selected_log_file
+                            st.success(f"Loaded logs from s3://{bucket}/{selected_log_file}")
+                        else:
+                            st.error("Failed to load log file from S3")
+
+                resource_configs = s3_list_keys(bucket, s3, "resource_configs/")
+                if resource_configs:
+                    config_files = [item["Key"] for item in resource_configs]
+                    selected_config_file = st.selectbox("Resource config file", options=config_files, key="s3_config_select")
+                    if selected_config_file and st.button("Load Resource Config", key="load_config_btn"):
+                        config_data = s3_get_bytes(s3, bucket, selected_config_file)
+                        if config_data:
+                            lab_name_from_cfg = selected_config_file.split('/')[-1].replace('_resource_config.json', '')
+                            lab_content_bytes = s3_get_bytes(s3, bucket, f"content_docs/{lab_name_from_cfg}.txt")
+                            if lab_content_bytes:
+                                st.session_state['lab_content'] = lab_content_bytes.decode('utf-8', errors='replace')
+                            st.session_state.cloudtrail_lab_spec_content = config_data.decode("utf-8", errors="replace")
+                            st.session_state.cloudtrail_selected_config_file = selected_config_file
+                            st.success(f"Loaded resource config from s3://{bucket}/{selected_config_file}")
+                        else:
+                            st.error("Failed to load resource config from S3")
                 else:
-                    st.error("Failed to load resource config from S3")
-        else:
-            st.info("No resource configs found in S3. Please generate some resource configs first.")
-    
-    else:  # Upload from device
-        st.subheader("Upload Files from Device")
-        uploaded_file = st.file_uploader("Upload CloudTrail JSON Log File", type="json", key="cloudtrail_uploader")
-        
-        if uploaded_file:
-            with st.spinner("Processing logs..."):
-                st.session_state.cloudtrail_organized_logs = load_and_process_logs(uploaded_file)
-        
-        lab_spec_file = st.file_uploader("Upload Lab Specification (JSON)", type="json", key="lab_spec")
-        if lab_spec_file:
-            try:
-                st.session_state.cloudtrail_lab_spec_content = lab_spec_file.read().decode("utf-8")
-                st.success("Lab specifications loaded.")
-            except:
-                st.error("Invalid lab specification JSON.")
+                    st.info("No resource configs found in S3.")
+
+            else:  # Upload from device
+                uploaded_file = st.file_uploader("Upload CloudTrail JSON Log File", type="json", key="cloudtrail_uploader")
+                if uploaded_file:
+                    with st.spinner("Processing logs..."):
+                        st.session_state.cloudtrail_organized_logs = load_and_process_logs(uploaded_file)
+                lab_spec_file = st.file_uploader("Upload Lab Specification (JSON)", type="json", key="lab_spec")
+                if lab_spec_file:
+                    try:
+                        st.session_state.cloudtrail_lab_spec_content = lab_spec_file.read().decode("utf-8")
+                        st.success("Lab specifications loaded.")
+                    except Exception:
+                        st.error("Invalid lab specification JSON.")
 
     # Status indicators
     col1, col2 = st.columns(2)
@@ -978,7 +1062,7 @@ def cloudtrail_analysis_module():
             st.success(f"✅ Logs loaded: {st.session_state.cloudtrail_selected_log_file or 'Uploaded file'}")
         else:
             st.info("📋 No logs loaded")
-    
+
     with col2:
         if st.session_state.cloudtrail_lab_spec_content:
             st.success(f"✅ Config loaded: {st.session_state.cloudtrail_selected_config_file or 'Uploaded file'}")
@@ -1010,49 +1094,87 @@ def cloudtrail_analysis_module():
         # Display content based on selected tab
         if selected_tab == "Summary":
             display_log_summary(st.session_state.cloudtrail_organized_logs)
-            
+
         elif selected_tab == "Detailed Logs":
             display_log_details(st.session_state.cloudtrail_organized_logs)
-            
-        elif selected_tab == "Errors Analysis in Lab":
-            st.markdown("### 🔍 Analyze Errors in the labs")
-            if st.session_state.cloudtrail_lab_spec_content:
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Analyze Lab Issues", key="analyze_lab_btn"):
-                        st.session_state.pop("gemini_lab_analysis", None)
-                        if "gemini_lab_analysis" not in st.session_state:
-                            try:
-                                asyncio.run(analyze_lab_with_gemini(st.session_state.cloudtrail_organized_logs, st.session_state.cloudtrail_lab_spec_content))
-                            except Exception as e:
-                                if "429" in str(e):
-                                    st.error("⚠️ Gemini API quota exceeded. Please wait a moment and try again, or check your API usage limits.")
-                                else:
-                                    st.error(f"API error: {e}")
-            else:
-                st.info("Please select or upload a resource config file to enable lab analysis.")
 
-            if "gemini_lab_analysis" in st.session_state:
-                st.markdown("### 🔍 Analysis Results")
-                st.markdown(st.session_state["gemini_lab_analysis"])
-                
-        elif selected_tab == "Resource Compliance":
-            st.markdown("### 🛠 Resource Creation Analysis")
-            if st.session_state.cloudtrail_lab_spec_content:
-                if st.button("Check Resource Creation Compliance", key="analyze_compliance_btn"):
-                    st.session_state.pop("gemini_resource_analysis", None)
-                    if "gemini_resource_analysis" not in st.session_state:
-                        try:
-                            asyncio.run(analyze_resource_creation(st.session_state.cloudtrail_organized_logs, st.session_state.cloudtrail_lab_spec_content))
-                        except Exception as e:
-                            if "429" in str(e):
-                                st.error("⚠️ API quota exceeded. Please wait a moment and try again, or check your API usage limits.")
-                            else:
-                                st.error(f"API error: {e}")
-                if "gemini_resource_analysis" in st.session_state:
-                    st.markdown(st.session_state["gemini_resource_analysis"])
+        elif selected_tab == "Errors Analysis in Lab":
+            st.markdown("### 🔍 Error Analysis Results")
+            if not st.session_state.cloudtrail_lab_spec_content:
+                st.info("Resource config not yet loaded — complete the main flow above first.")
             else:
-                st.info("Please select or upload a resource config file to enable compliance analysis.")
+                analysis = st.session_state.get("gemini_lab_analysis")
+                if analysis:
+                    # Show cached report + optional re-run
+                    saved_key = st.session_state.get("flow_error_analysis_key", "")
+                    if saved_key:
+                        st.caption(f"📄 Report saved to S3: `{saved_key}`")
+                    st.markdown(analysis)
+                    if st.button("🔄 Re-run error analysis", key="rerun_error_btn"):
+                        st.session_state.pop("gemini_lab_analysis", None)
+                        st.session_state["flow_error_analysis_done"] = False
+                        st.session_state["flow_error_analysis_key"] = None
+                        st.rerun()
+                else:
+                    # Not yet run — trigger manually if auto-flow hasn't fired yet
+                    if st.button("▶ Run Error Analysis", key="analyze_lab_btn", type="primary"):
+                        try:
+                            asyncio.run(analyze_lab_with_gemini(
+                                st.session_state.cloudtrail_organized_logs,
+                                st.session_state.cloudtrail_lab_spec_content
+                            ))
+                            bucket2, s3_2 = get_s3()
+                            report = st.session_state.get("gemini_lab_analysis", "")
+                            if report and bucket2 and s3_2:
+                                lab_n  = st.session_state.get("flow_lab_name", "unknown")
+                                uid    = st.session_state.get("flow_user_id", "unknown")
+                                aid    = st.session_state.get("flow_selected_attempt", "unknown")
+                                iam_u  = st.session_state.get("flow_iam_username", "")
+                                ekey   = _report_key(lab_n, uid, aid, "error_analysis", iam_u)
+                                save_report_to_s3(s3_2, bucket2, ekey, report)
+                                st.session_state["flow_error_analysis_key"]  = ekey
+                                st.session_state["flow_error_analysis_done"] = True
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Analysis failed: {e}")
+
+        elif selected_tab == "Resource Compliance":
+            st.markdown("### 🛠 Resource Compliance Results")
+            if not st.session_state.cloudtrail_lab_spec_content:
+                st.info("Resource config not yet loaded — complete the main flow above first.")
+            else:
+                compliance = st.session_state.get("gemini_resource_analysis")
+                if compliance:
+                    saved_key = st.session_state.get("flow_compliance_key", "")
+                    if saved_key:
+                        st.caption(f"📄 Report saved to S3: `{saved_key}`")
+                    st.markdown(compliance)
+                    if st.button("🔄 Re-run compliance check", key="rerun_compliance_btn"):
+                        st.session_state.pop("gemini_resource_analysis", None)
+                        st.session_state["flow_compliance_done"] = False
+                        st.session_state["flow_compliance_key"] = None
+                        st.rerun()
+                else:
+                    if st.button("▶ Run Compliance Check", key="analyze_compliance_btn", type="primary"):
+                        try:
+                            asyncio.run(analyze_resource_creation(
+                                st.session_state.cloudtrail_organized_logs,
+                                st.session_state.cloudtrail_lab_spec_content
+                            ))
+                            bucket2, s3_2 = get_s3()
+                            report = st.session_state.get("gemini_resource_analysis", "")
+                            if report and bucket2 and s3_2:
+                                lab_n = st.session_state.get("flow_lab_name", "unknown")
+                                uid   = st.session_state.get("flow_user_id", "unknown")
+                                aid   = st.session_state.get("flow_selected_attempt", "unknown")
+                                iam_u = st.session_state.get("flow_iam_username", "")
+                                ckey  = _report_key(lab_n, uid, aid, "compliance", iam_u)
+                                save_report_to_s3(s3_2, bucket2, ckey, report)
+                                st.session_state["flow_compliance_key"]  = ckey
+                                st.session_state["flow_compliance_done"] = True
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Compliance check failed: {e}")
     else:
         st.info("Please select or upload CloudTrail logs to begin analysis.")
 
@@ -1305,24 +1427,50 @@ def pw_get_all_ace_values(page) -> List[str]:
 # Execution Logs helpers
 # -----------------------------
 EDITOR_IDS_RE = re.compile(r"/cloudlabeditor/(\d+)/(\d+)/(\d+)", re.IGNORECASE)
+# Published link: /collection/page/<id1>/<id2>/<id3>/cloudlab  or  /collection/page/<id1>/<id2>/<id3>
+PUBLISHED_IDS_RE = re.compile(r"/collection/page/(\d+)/(\d+)/(\d+)", re.IGNORECASE)
+
+def normalize_lab_url_to_editor(url: str) -> str:
+    """
+    Accept both published and editor URLs and return a canonical editor URL.
+    Published:  https://www.educative.io/collection/page/10370001/4618838700982272/5256267680710656/cloudlab
+    Editor:     https://www.educative.io/editor/cloudlabeditor/10370001/4618838700982272/5256267680710656
+    Returns the editor URL (or the original if already in editor format / unrecognized).
+    """
+    url = (url or "").strip()
+    # Already an editor URL?
+    if EDITOR_IDS_RE.search(url):
+        return url
+    # Try published format
+    m = PUBLISHED_IDS_RE.search(url)
+    if m:
+        id1, id2, id3 = m.group(1), m.group(2), m.group(3)
+        return f"https://www.educative.io/editor/cloudlabeditor/{id1}/{id2}/{id3}"
+    return url
 
 def parse_editor_ids(editor_url: str) -> Optional[Tuple[str, str, str]]:
-    m = EDITOR_IDS_RE.search(editor_url or "")
+    # Normalise first so published links also work
+    normalised = normalize_lab_url_to_editor(editor_url or "")
+    m = EDITOR_IDS_RE.search(normalised)
     if not m:
         return None
     return m.group(1), m.group(2), m.group(3)
 
-def build_events_api_url(editor_url: str, user_id: str, attempt_id: str, region: str) -> Optional[str]:
+def build_events_api_url(editor_url: str, user_id: str, attempt_id: str, region: str,
+                         iam_username: str = "") -> Optional[str]:
     ids = parse_editor_ids(editor_url)
     if not ids:
         return None
     id1, id2, id3 = ids
-    region = (region or "").strip()
-    user_id = (user_id or "").strip()
+    region     = (region     or "").strip()
+    user_id    = (user_id    or "").strip()
     attempt_id = (attempt_id or "").strip()
     if not (region and user_id and attempt_id):
         return None
-    return f"https://www.educative.io/api/cloud-lab/{id1}/{id2}/{id3}/events?user_id={user_id}&attempt_id={attempt_id}&region={region}"
+    url = f"https://www.educative.io/api/cloud-lab/{id1}/{id2}/{id3}/events?user_id={user_id}&attempt_id={attempt_id}&region={region}"
+    if (iam_username or "").strip():
+        url += f"&iam_username={iam_username.strip()}"
+    return url
 
 def get_root_url_from_content_file(s3, bucket: str, lab: str) -> Optional[str]:
     key = f"content_docs/{lab}.txt"
@@ -1332,6 +1480,54 @@ def get_root_url_from_content_file(s3, bucket: str, lab: str) -> Optional[str]:
     text = data.decode("utf-8", errors="replace")
     m = re.search(r"^Root URL:\s*(\S+)", text, flags=re.MULTILINE)
     return m.group(1) if m else None
+
+def extract_lab_display_name_from_content(content_text: str) -> Optional[str]:
+    """Extract the human-readable lab name from [Task 1] line in content file."""
+    m = re.search(r"^\[Task 1\]\s+(.+)$", content_text, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def rename_lab_files_in_s3(s3, bucket: str, old_name: str, new_name: str) -> bool:
+    """
+    Rename all S3 files for a lab from old_name to new_name.
+    Copies objects to new keys and deletes the originals.
+    Returns True if any renames were performed.
+    """
+    prefixes_and_suffixes = [
+        ("content_docs/", ".txt"),
+        ("policies/", ".json"),
+        ("prescript/", ".json"),
+        ("resource_configs/", "_resource_config.json"),
+    ]
+    old_san = sanitize_lab_name(old_name)
+    new_san = sanitize_lab_name(new_name)
+    if old_san == new_san:
+        return False
+    renamed = False
+    for prefix, suffix in prefixes_and_suffixes:
+        old_key = f"{prefix}{old_san}{suffix}"
+        new_key = f"{prefix}{new_san}{suffix}"
+        if s3_object_exists(s3, bucket, old_key):
+            try:
+                s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": old_key}, Key=new_key)
+                s3.delete_object(Bucket=bucket, Key=old_key)
+                renamed = True
+            except Exception as e:
+                print(f"Rename failed {old_key} → {new_key}: {e}")
+    # Also rename execution_logs which have a different pattern
+    exec_prefix = f"execution_logs/{old_san}_"
+    items = s3_list_keys(bucket, s3, exec_prefix)
+    for item in items:
+        old_key = item["Key"]
+        new_key = old_key.replace(exec_prefix, f"execution_logs/{new_san}_", 1)
+        try:
+            s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": old_key}, Key=new_key)
+            s3.delete_object(Bucket=bucket, Key=old_key)
+            renamed = True
+        except Exception as e:
+            print(f"Rename exec log failed {old_key}: {e}")
+    return renamed
 
 def fetch_execution_logs(api_url: str, cookie_header: str) -> Dict:
     """Fetch JSON logs from events API. Uses Cookie header if provided."""
@@ -1434,141 +1630,7 @@ def parse_attempts_from_history(history_json: Any) -> List[Dict[str, Any]]:
         })
     return attempts
 
-def cloudtrail_section_ui(*, bucket: str, s3, lab_name: str, default_editor_url: Optional[str], cookie_header: str):
-    """Renders the Execution Logs UI and writes output to S3."""
-    st.divider()
-    st.subheader("Execution Logs (CloudTrail-like)")
-
-    if not lab_name:
-        st.info("Select or create a lab first to attach execution logs.")
-        return
-
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        st.caption("Editor URL used to derive the API endpoint")
-        editor_url = st.text_input(
-            "Lab Editor URL",
-            value=default_editor_url or "",
-            placeholder="https://www.educative.io/editor/cloudlabeditor/<id1>/<id2>/<id3>",
-            key=f"editor_url_{lab_name}"
-        )
-    with col_b:
-        ids = parse_editor_ids(editor_url or "")
-        st.write("IDs parsed:" + (f" {ids}" if ids else " —"))
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        user_id = st.text_input("User ID", key=f"user_{lab_name}")
-    with col2:
-        attempt_id = st.text_input("Attempt ID", key=f"attempt_{lab_name}")
-    with col3:
-        region = st.text_input("Region", value="us-east-1", key=f"region_{lab_name}")
-
-    # ---- NEW: Attempts history UI
-    hist_col1, hist_col2 = st.columns([1, 2])
-    with hist_col1:
-        run_hist = st.button("Check attempts history", key=f"check_hist_{lab_name}")
-    with hist_col2:
-        st.caption("Looks up the user's attempts for this lab, so you can pick the correct attempt_id.")
-
-    if run_hist:
-        if not (editor_url and user_id):
-            st.error("Please provide Editor URL and User ID to check history.")
-        else:
-            history_url = build_history_api_url(editor_url, user_id)
-            if not history_url:
-                st.error("Could not build the history API URL. Check the editor URL and inputs.")
-            else:
-                with st.spinner("Fetching attempts history…"):
-                    try:
-                        history_json = fetch_attempt_history(history_url, cookie_header)
-                    except Exception as e:
-                        st.error(f"Failed to fetch history: {e}")
-                        history_json = None
-
-                if history_json is not None:
-                    attempts = parse_attempts_from_history(history_json)
-                    count = len(attempts)
-                    st.info(f"Found **{count}** attempt(s) for user `{user_id}` in this lab.")
-                    if count:
-                        st.dataframe(attempts, use_container_width=True)
-                        # Let the user pick one
-                        choices = [a["attempt_id"] for a in attempts if a.get("attempt_id")]
-                        default_idx = 0 if choices else None
-                        # chosen = st.selectbox("Choose an attempt to use", options=choices or [""],
-                        #                       index=default_idx if default_idx is not None else 0,
-                        #                       key=f"attempt_pick_{lab_name}")
-                        # if chosen:
-                        #     use_btn = st.button("Use selected attempt", key=f"use_attempt_{lab_name}")
-                        #     if use_btn:
-                        #         # Autofill Attempt ID and Region (if available)
-                        #         picked = next((a for a in attempts if a.get("attempt_id") == chosen), None)
-                        #         st.session_state[f"attempt_{lab_name}"] = chosen
-                        #         if picked and picked.get("region"):
-                        #             st.session_state[f"region_{lab_name}"] = picked["region"]
-                        #         st.success(f"Using attempt_id={chosen}" + (f", region={picked.get('region')}" if picked and picked.get("region") else ""))
-
-                        #         # Optional: show the exact events URL we’ll hit next
-                        #         api_url = build_events_api_url(editor_url, user_id, chosen, st.session_state.get(f"region_{lab_name}", region))
-                        #         if api_url:
-                        #             st.caption("Events API URL:")
-                        #             st.code(api_url, language="text")
-
-    # ---- Existing logs in S3, unchanged
-    run = st.button("Fetch & Save Execution Logs to S3", type="primary", key=f"fetch_logs_{lab_name}")
-
-    existing = list_execution_logs_for_lab(s3, bucket, lab_name)
-    with st.expander("Existing logs for this lab in S3"):
-        if existing:
-            key_choice = st.selectbox("Pick a saved logs file to preview", options=existing, index=0, key=f"existing_logs_{lab_name}")
-            if key_choice:
-                st.markdown("**Preview**")
-                view_s3_file_inline(s3, bucket, key_choice, preview_chars=4000)
-                selected = st.button("Use this logs file for analysis", key=f"use_logs_{lab_name}")
-                if selected:
-                    st.session_state.setdefault("selected_lab_files", {})
-                    st.session_state["selected_lab_files"]["execution_logs_key"] = key_choice
-                    # NEW: load into session so generators can read it
-                    data = s3_get_bytes(s3, bucket, key_choice)
-                    if data:
-                        st.session_state["log_content"] = data.decode("utf-8", errors="replace")
-                        st.success(f"Selected & loaded logs: {key_choice}")
-                    else:
-                        st.warning("Could not load the selected logs file.")
-        else:
-            st.caption("No logs yet. Fetch and save to create one.")
-
-    if run:
-        if not (editor_url and user_id and (st.session_state.get(f"attempt_{lab_name}") or attempt_id) and (st.session_state.get(f"region_{lab_name}") or region)):
-            st.error("Please fill all inputs (Editor URL, User ID, Attempt ID, Region). Tip: use 'Check attempts history' above.")
-            return
-
-        # Prefer session_state (if user picked an attempt) over the text inputs
-        effective_attempt = st.session_state.get(f"attempt_{lab_name}") or attempt_id
-        effective_region = st.session_state.get(f"region_{lab_name}") or region
-
-        api_url = build_events_api_url(editor_url, user_id, effective_attempt, effective_region)
-        if not api_url:
-            st.error("Could not build the events API URL. Check the editor URL and inputs.")
-            return
-
-        with st.spinner("Fetching execution logs..."):
-            try:
-                logs = fetch_execution_logs(api_url, cookie_header)
-            except Exception as e:
-                st.error(f"Failed to fetch logs: {e}")
-                return
-
-        key = f"execution_logs/{sanitize_lab_name(lab_name)}_{user_id}_{attempt_id}.json"
-        try:
-            s3_put_json(s3, bucket, key, logs)
-            st.success(f"Saved logs to s3://{bucket}/{key}")
-            view_s3_file_inline(s3, bucket, key, preview_chars=200000)
-            st.session_state.setdefault("selected_lab_files", {})
-            st.session_state["selected_lab_files"]["execution_logs_key"] = key
-        except Exception as e:
-            st.error(f"Failed to write logs to S3: {e}")
-
+# cloudtrail_section_ui removed — logic handled inside lab_extractor_module auto-flow
 
 # -----------------------------
 # OpenAI single-call extraction
@@ -1874,11 +1936,480 @@ def generate_resource_config_section(*, bucket: str, s3, lab_name: str):
         st.error(f"Failed to write resource config: {e}")
 
 # -----------------------------
-# Main Lab Extraction Module
+# Main Lab Extraction Module  — streamlined auto-flow
 # -----------------------------
+def _init_flow_state():
+    """Initialise all session-state keys used by the auto-flow exactly once."""
+    defaults = {
+        # inputs
+        "flow_lab_url": "",
+        "flow_user_id": "",
+        "flow_iam_username": "",
+        # derived
+        "flow_editor_url": "",
+        "flow_lab_name": "",          # sanitized name used as S3 key
+        "flow_lab_display_name": "",  # human-readable name from [Task 1]
+        # progress flags
+        "flow_lab_extracted": False,
+        "flow_history_loaded": False,
+        "flow_logs_fetched": False,
+        "flow_rc_generated": False,
+        # data
+        "flow_attempts": [],
+        "flow_selected_attempt": None,
+        "flow_selected_region": "us-east-1",
+        "flow_execution_log_key": None,
+        "flow_resource_config_key": None,
+        # analysis reports
+        "flow_error_analysis_key": None,
+        "flow_compliance_key": None,
+        "flow_error_analysis_done": False,
+        "flow_compliance_done": False,
+        # user-chosen options (set before flow starts)
+        "flow_opt_force_extract": False,    # re-extract latest lab content + RC
+        "flow_opt_fetch_validation": False, # fetch attempt validation results
+        # validation data
+        "flow_validation_data": None,       # raw validation API response dict
+        "flow_validation_fetched": False,
+        # whether the flow has been started at all (button guard)
+        "flow_started": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def _auto_extract_lab(*, s3, bucket: str, root_url: str, cookie_header: str, status_container) -> bool:
+    """
+    Run Playwright extraction for the lab at root_url, save to S3, auto-detect lab name.
+    Returns True on success.
+    """
+    try:
+        ensure_chromium_installed()
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            import subprocess, sys
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+            from playwright.sync_api import sync_playwright
+
+        links: List[TaskLink] = []
+        arts: List[TaskArtifact] = []
+        landing_artifact: Optional[TaskArtifact] = None
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
+            cookie_value = ""
+            if cookie_header:
+                line = cookie_header
+                if ":" in line:
+                    k2, v2 = line.split(":", 1)
+                    if k2.strip().lower() == "cookie":
+                        cookie_value = v2.strip()
+                else:
+                    cookie_value = line.strip()
+            if cookie_value:
+                ctx.add_cookies(parse_cookie_header_to_playwright_cookies(cookie_value, root_url))
+
+            page = ctx.new_page()
+            page.set_default_timeout(20000)
+
+            page.goto(root_url, wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle")
+            except Exception:
+                pass
+
+            landing_slate = pw_get_slate_text(page)
+            ace_vals = pw_get_all_ace_values(page)
+            landing_blocks = [{"type": "ace", "content": v} for v in ace_vals if str(v).strip()]
+            landing_title = page.title() or root_url
+            landing_artifact = TaskArtifact(url=root_url, title=landing_title, slate_text=landing_slate, code_blocks=landing_blocks)
+
+            anchors = page.eval_on_selector_all(
+                'a[href*="cloudlabeditor"]',
+                '''els => els.map(el => {
+                    function categoryOf(node){
+                      let p = node;
+                      for (let i=0;i<20 && p;i++){
+                        const s = p.querySelector && p.querySelector('span.text-xl');
+                        if (s && s.textContent.trim()) return s.textContent.trim();
+                        p = p.parentElement;
+                      }
+                      return null;
+                    }
+                    return {
+                      href: el.getAttribute('href') || '',
+                      title: (el.textContent || '').trim(),
+                      category: categoryOf(el)
+                    };
+                })'''
+            )
+            for a in anchors:
+                href_abs = normalize_url(root_url, a.get("href", ""))
+                if href_abs:
+                    links.append(TaskLink(category=a.get("category"), title=a.get("title", ""), href=href_abs))
+
+            if not links:
+                html = page.content() or ""
+                for href in re.findall(r"/(?:editor/)?cloudlabeditor/[0-9]+/[0-9]+/[0-9]+/[0-9]+", html):
+                    href_abs = normalize_url(root_url, href)
+                    if href_abs:
+                        links.append(TaskLink(category=None, title="", href=href_abs))
+
+            for tl in links:
+                try:
+                    page.goto(tl.href, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_load_state("networkidle")
+                    except Exception:
+                        pass
+                    slate_text = pw_get_slate_text(page)
+                    per_task_code_vals = pw_get_all_ace_values(page)
+                    code_blocks = [{"type": "ace", "content": v} for v in per_task_code_vals if str(v).strip()]
+                    title = tl.title or (page.title() or tl.href)
+                    arts.append(TaskArtifact(url=tl.href, title=title, slate_text=slate_text, code_blocks=code_blocks))
+                    time.sleep(0.2)
+                except Exception:
+                    arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
+
+            ctx.close()
+            browser.close()
+
+        status_container.write(f"Extracted {len(links)} task(s).")
+
+        # Use a temporary sanitized name derived from URL IDs so we can save first
+        ids = parse_editor_ids(root_url)
+        temp_name = f"lab_{'_'.join(ids)}" if ids else sanitize_lab_name(f"lab_{hashlib.sha256(root_url.encode()).hexdigest()[:8]}")
+
+        content_key, policy_key, prescript_key = s3_write_outputs_to_folders(
+            s3=s3, bucket=bucket, lab_name=temp_name,
+            root_url=root_url, landing=landing_artifact, tasks=arts,
+        )
+
+        # Auto-detect display name from [Task 1] line
+        content_bytes = s3_get_bytes(s3, bucket, content_key)
+        display_name = ""
+        if content_bytes:
+            content_text = content_bytes.decode("utf-8", errors="replace")
+            display_name = extract_lab_display_name_from_content(content_text) or ""
+
+        # If we got a real display name, rename files to use it
+        if display_name:
+            rename_lab_files_in_s3(s3, bucket, temp_name, display_name)
+            final_name = sanitize_lab_name(display_name)
+        else:
+            final_name = temp_name
+            display_name = temp_name
+
+        st.session_state["flow_lab_name"] = final_name
+        st.session_state["flow_lab_display_name"] = display_name
+        st.session_state["flow_lab_extracted"] = True
+
+        # ── Register in DynamoDB so future runs skip extraction ───────────────
+        lab_id = _lab_id_from_url(root_url)
+        if lab_id:
+            dynamo_put_lab(
+                lab_id=lab_id,
+                lab_display_name=display_name,
+                lab_s3_name=final_name,
+                root_url=root_url,
+            )
+
+        # Load lab content + policy + prescript into session for downstream use
+        sel = {
+            "content_key": f"content_docs/{final_name}.txt",
+            "policy_key": f"policies/{final_name}.json",
+            "prescript_key": f"prescript/{final_name}.json",
+        }
+        hydrate_selected_lab_assets_into_session(bucket, s3, sel)
+
+        return True
+    except Exception as e:
+        st.error(f"Lab extraction failed: {e}")
+        return False
+
+
+def _auto_fetch_history(*, editor_url: str, user_id: str, cookie_header: str) -> List[Dict[str, Any]]:
+    history_url = build_history_api_url(editor_url, user_id)
+    if not history_url:
+        return []
+    try:
+        history_json = fetch_attempt_history(history_url, cookie_header)
+        return parse_attempts_from_history(history_json)
+    except Exception as e:
+        st.warning(f"Could not fetch attempts history: {e}")
+        return []
+
+
+def _auto_fetch_logs(*, s3, bucket: str, editor_url: str, user_id: str, attempt: Dict[str, Any],
+                     lab_name: str, cookie_header: str, iam_username: str = "") -> Optional[str]:
+    """
+    Fetch execution logs for the given attempt and save to S3. Returns the S3 key.
+
+    Key scheme:
+      execution_logs/<lab>_<user_id>_<attempt_id>.json          (no IAM user)
+      execution_logs/<lab>_<user_id>_<attempt_id>_iam_<iam>.json (IAM user specified)
+
+    If the key already exists in S3 the API call is skipped and the existing
+    file is loaded directly — unless a re-fetch is explicitly requested.
+    """
+    attempt_id = attempt.get("attempt_id", "")
+    region     = attempt.get("region") or "us-east-1"
+
+    # Build the S3 key — include IAM username when provided so each variant is unique
+    iam_suffix = f"_iam_{iam_username.strip()}" if (iam_username or "").strip() else ""
+    key = f"execution_logs/{sanitize_lab_name(lab_name)}_{user_id}_{attempt_id}{iam_suffix}.json"
+
+    # ── Return cached file if it already exists ───────────────────────────────
+    if s3_object_exists(s3, bucket, key):
+        existing = s3_get_bytes(s3, bucket, key)
+        if existing:
+            st.session_state["log_content"] = existing.decode("utf-8", errors="replace")
+            st.session_state.setdefault("selected_lab_files", {})["execution_logs_key"] = key
+            return key  # reuse without API call
+
+    # ── Fetch from API ────────────────────────────────────────────────────────
+    api_url = build_events_api_url(editor_url, user_id, attempt_id, region, iam_username=iam_username)
+    if not api_url:
+        st.warning("Could not build events API URL.")
+        return None
+    try:
+        logs = fetch_execution_logs(api_url, cookie_header)
+        s3_put_json(s3, bucket, key, logs)
+        st.session_state["log_content"] = json.dumps(logs)
+        st.session_state.setdefault("selected_lab_files", {})["execution_logs_key"] = key
+        return key
+    except Exception as e:
+        st.warning(f"Failed to fetch execution logs: {e}")
+        return None
+
+
+def _auto_generate_resource_config(*, s3, bucket: str, lab_name: str,
+                                    force: bool = False) -> Optional[str]:
+    """
+    Generate resource config JSON and save to S3. Returns the S3 key.
+    If the file already exists in S3 and force=False, loads it directly
+    without calling the AI model again.
+    """
+    rc_key = f"resource_configs/{sanitize_lab_name(lab_name)}_resource_config.json"
+
+    # ── Check if already exists in S3 ────────────────────────────────────────
+    if not force and s3_object_exists(s3, bucket, rc_key):
+        existing = s3_get_bytes(s3, bucket, rc_key)
+        if existing:
+            st.session_state.setdefault("selected_lab_files", {})["resource_config_key"] = rc_key
+            st.session_state["cloudtrail_lab_spec_content"] = existing.decode("utf-8", errors="replace")
+            return rc_key  # reuse without re-generating
+
+    # ── Generate from content file ────────────────────────────────────────────
+    content_key = f"content_docs/{sanitize_lab_name(lab_name)}.txt"
+    if not s3_object_exists(s3, bucket, content_key):
+        return None
+    client = _openai_client()
+    if not client:
+        return None
+    content_text = _load_text_from_s3(s3, bucket, content_key) or ""
+    if not content_text.strip():
+        return None
+    question = "Extract all AWS resources the learner creates/configures in this lab and their configurations as JSON."
+    raw_payload = call_openai_extract(client, content_text, question)
+    normalized = normalize_payload(raw_payload)
+    try:
+        s3_put_json(s3, bucket, rc_key, normalized)
+        st.session_state.setdefault("selected_lab_files", {})["resource_config_key"] = rc_key
+        st.session_state["cloudtrail_lab_spec_content"] = json.dumps(normalized, indent=2)
+        return rc_key
+    except Exception as e:
+        st.warning(f"Failed to save resource config: {e}")
+        return None
+
+
+def build_validation_api_url(editor_url: str, user_id: str, attempt_id: str) -> Optional[str]:
+    """
+    Build the attempt-validation API URL.
+    Pattern: https://www.educative.io/api/cloud-lab/attempts/{id1}/{id2}/{id3}/{user_id}?attempt_id={attempt_id}
+    """
+    ids = parse_editor_ids(editor_url)
+    if not ids:
+        return None
+    id1, id2, id3 = ids
+    if not (user_id and attempt_id):
+        return None
+    return (
+        f"https://www.educative.io/api/cloud-lab/attempts/{id1}/{id2}/{id3}"
+        f"/{user_id.strip()}?attempt_id={attempt_id}"
+    )
+
+
+def fetch_validation_results(api_url: str, cookie_header: str) -> Optional[Dict[str, Any]]:
+    """Call the validation API and return the parsed JSON response."""
+    import requests as _requests
+    headers = {}
+    if cookie_header:
+        ch = cookie_header.strip()
+        if not ch.lower().startswith("cookie"):
+            ch = "Cookie: " + ch
+        k, v = ch.split(":", 1)
+        headers[k.strip()] = v.strip()
+    headers["User-Agent"] = USER_AGENT
+    resp = _requests.get(api_url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _display_validation_results(data: Dict[str, Any]):
+    """Render the validation API response in a structured, readable way."""
+    attempt = data.get("attempt", {})
+    if not attempt:
+        st.warning("No attempt data in validation response.")
+        return
+
+    # ── Header metrics ────────────────────────────────────────────────────────
+    progress = attempt.get("progress", {})
+    env      = attempt.get("environment", {})
+    status   = attempt.get("status", {})
+
+    st.markdown("#### Attempt Overview")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Attempt #",     attempt.get("id", "—"))
+    m2.metric("Completed",     progress.get("completed", 0))
+    m3.metric("In Progress",   progress.get("in_progress", 0))
+    m4.metric("Not Started",   progress.get("not_started", 0))
+    pct = progress.get("completion_percentage", 0)
+    m5.metric("Completion",    f"{pct:.1f}%")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.caption(f"**Setup:** {status.get('setup', '—')}")
+        st.caption(f"**Termination:** {status.get('termination', '—')}")
+    with col_b:
+        st.caption(f"**AWS Account:** {env.get('account_id', '—')}")
+        st.caption(f"**Start:** {attempt.get('start_time', '—')}")
+        st.caption(f"**End:** {attempt.get('end_time', '—')}")
+
+    st.divider()
+
+    # ── Tasks table ───────────────────────────────────────────────────────────
+    tasks = attempt.get("tasks", [])
+    if not tasks:
+        st.info("No task data available.")
+        return
+
+    st.markdown("#### Task Results")
+
+    # Build numbered rows — task number derived from list position (1-indexed)
+    rows = []
+    for i, t in enumerate(tasks, start=1):
+        task_status = t.get("status", "unknown")
+        icon = {
+            "completed":   "✅",
+            "in_progress": "🔄",
+            "not_started": "⬜",
+            "tried":       "🟡",
+        }.get(task_status, "❓")
+
+        # Combine message + failure_message into a single cell
+        msg = t.get("message", "—") or "—"
+        failure = (t.get("failure_message") or "").strip()
+        combined_message = f"{msg} — {failure}" if failure else msg
+
+        rows.append({
+            "#":             i,
+            "Task ID":       t.get("task_id", "—"),
+            "Status":        f"{icon} {task_status}",
+            "Message":       combined_message,
+            "Score":         t.get("score", 0),
+            "Total Tests":   t.get("total_tests", 0),
+            "Passed Tests":  t.get("passed_tests", 0),
+            "Attempts":      t.get("attempts", 0),
+            "Last Attempt":  t.get("last_attempt") or "—",
+        })
+
+    st.dataframe(rows, use_container_width=True)
+
+    # Highlight tasks that have notable messages (completed tasks excluded from noise)
+    generic = {"Task not yet started", "Task completed", "—"}
+    notable = [r for r in rows if r["Message"] not in generic]
+    if notable:
+        st.markdown("**Notable task messages:**")
+        for r in notable:
+            if "completed" in r["Status"]:
+                colour = "green"
+            elif "tried" in r["Status"]:
+                colour = "orange"
+            else:
+                colour = "gray"
+            st.markdown(f"- Task **#{r['#']}** (ID `{r['Task ID']}`): :{colour}[{r['Message']}]")
+
+
+def _run_cached_analyses(*, s3, bucket: str, lab_name: str, user_id: str, attempt_id: str,
+                         iam_username: str = ""):
+    """
+    Auto-run error analysis and resource compliance if not already done for this
+    lab+user+attempt combination.  Results are saved to S3 so revisiting is instant.
+    Both analyses require organized logs AND a resource config spec to be in session.
+    """
+    organized_logs = st.session_state.get("cloudtrail_organized_logs")
+    lab_spec       = st.session_state.get("cloudtrail_lab_spec_content")
+
+    if not organized_logs or not lab_spec:
+        # Prerequisites not met — analysis tabs will show an info message
+        return
+
+    error_key      = _report_key(lab_name, user_id, attempt_id, "error_analysis", iam_username)
+    compliance_key = _report_key(lab_name, user_id, attempt_id, "compliance",     iam_username)
+
+    # ── Step 6: Error analysis ────────────────────────────────────────────────
+    if not st.session_state.get("flow_error_analysis_done"):
+        # Try to load a previously saved report first
+        saved = load_report_from_s3(s3, bucket, error_key)
+        if saved:
+            st.session_state["gemini_lab_analysis"]      = saved
+            st.session_state["flow_error_analysis_key"]  = error_key
+            st.session_state["flow_error_analysis_done"] = True
+        else:
+            with st.status("⚙️ Step 6 — Analyzing errors in lab…", expanded=True) as status:
+                try:
+                    asyncio.run(analyze_lab_with_gemini(organized_logs, lab_spec))
+                    report = st.session_state.get("gemini_lab_analysis", "")
+                    if report:
+                        save_report_to_s3(s3, bucket, error_key, report)
+                        st.session_state["flow_error_analysis_key"]  = error_key
+                        st.session_state["flow_error_analysis_done"] = True
+                        status.update(label="✅ Error analysis complete", state="complete")
+                    else:
+                        status.update(label="⚠️ Error analysis returned empty result", state="error")
+                except Exception as e:
+                    status.update(label=f"⚠️ Error analysis failed: {e}", state="error")
+
+    # ── Step 7: Resource compliance ───────────────────────────────────────────
+    if not st.session_state.get("flow_compliance_done"):
+        saved = load_report_from_s3(s3, bucket, compliance_key)
+        if saved:
+            st.session_state["gemini_resource_analysis"] = saved
+            st.session_state["flow_compliance_key"]      = compliance_key
+            st.session_state["flow_compliance_done"]     = True
+        else:
+            with st.status("⚙️ Step 7 — Checking resource compliance…", expanded=True) as status:
+                try:
+                    asyncio.run(analyze_resource_creation(organized_logs, lab_spec))
+                    report = st.session_state.get("gemini_resource_analysis", "")
+                    if report:
+                        save_report_to_s3(s3, bucket, compliance_key, report)
+                        st.session_state["flow_compliance_key"]  = compliance_key
+                        st.session_state["flow_compliance_done"] = True
+                        status.update(label="✅ Resource compliance complete", state="complete")
+                    else:
+                        status.update(label="⚠️ Compliance check returned empty result", state="error")
+                except Exception as e:
+                    status.update(label=f"⚠️ Compliance check failed: {e}", state="error")
+
+
 def lab_extractor_module():
     st.header("Lab Content Extractor")
-    st.caption("Educative CloudLabs with Playwright + Requests fallback. Outputs are saved to S3 (content_docs / policies / prescript / execution_logs).")
+    _init_flow_state()
 
     # --- S3 init
     bucket, s3 = get_s3()
@@ -1886,402 +2417,376 @@ def lab_extractor_module():
         st.error("Missing S3 setup. Add [aws] bucket/region/credentials to secrets.toml.")
         st.stop()
 
-    # --- Cookie source controls
+    # --- Cookie
     default_cookie = (st.secrets.get("cookies", {}) or {}).get("educative", "")
     cookie_source = st.selectbox(
         "Cookie source",
         options=("Use cookie from secrets", "Enter custom cookie"),
         index=0 if default_cookie else 1,
-        help="Use a Cookie header from secrets.toml or supply a fresh one."
     )
-    custom_cookie = ""
-    show_cookie_preview = ""
     if cookie_source == "Use cookie from secrets":
-        show_cookie_preview = (default_cookie[:80] + "…") if len(default_cookie) > 80 else default_cookie
-        st.text_input("Cookie (from secrets, read-only)", value=show_cookie_preview, disabled=True)
+        cookie_preview = (default_cookie[:80] + "…") if len(default_cookie) > 80 else default_cookie
+        st.text_input("Cookie (from secrets, read-only)", value=cookie_preview, disabled=True)
+        cookie_header = default_cookie.strip()
     else:
-        custom_cookie = st.text_area("Custom Cookie (paste full `Cookie:` line or just the cookie value)", height=100)
-
-    st.divider()
-
-    # --- Quick S3 Browser
-    with st.expander("🔎 Browse S3 files (content_docs / policies / execution_logs)", expanded=False):
-        s3_prefix_browser_ui(bucket, s3)
-
-    # --- Mode: use existing OR extract new
-    mode = st.radio(
-        "What would you like to do?",
-        options=("Use existing from S3", "Extract new or refresh"),
-        index=0,
-        help="Pick an already-saved lab to download/preview, or extract a new lab and save it to S3."
-    )
-
-    cookie_header = default_cookie.strip() if cookie_source == "Use cookie from secrets" else custom_cookie.strip()
+        raw_custom = st.text_area("Custom Cookie (paste full `Cookie:` line or just the cookie value)", height=80)
+        cookie_header = raw_custom.strip()
     if cookie_header and not cookie_header.lower().startswith("cookie"):
         cookie_header = "Cookie: " + cookie_header
 
-    if mode == "Use existing from S3":
-        with st.status("Listing labs in S3…", expanded=False):
+    st.divider()
+
+    # ── SECONDARY PATH: Use existing lab from S3 ──────────────────────────────
+    with st.expander("📂 Use an existing lab from S3 (optional)", expanded=False):
+        with st.spinner("Listing labs in S3…"):
             labs = s3_list_labs(bucket, s3)
-        if not labs:
-            st.info("No labs found in S3 yet. Switch to **Extract new or refresh** to add one.")
-            st.stop()
+        if labs:
+            lab_choice = st.selectbox("Choose a saved lab", options=labs, index=0, key="existing_lab_choice")
+            if lab_choice and st.button("Load existing lab", key="load_existing_lab"):
+                sel = {
+                    "content_key": f"content_docs/{lab_choice}.txt",
+                    "policy_key": f"policies/{lab_choice}.json",
+                    "prescript_key": f"prescript/{lab_choice}.json",
+                }
+                hydrate_selected_lab_assets_into_session(bucket, s3, sel)
+                st.session_state["flow_lab_name"] = lab_choice
+                st.session_state["flow_lab_display_name"] = lab_choice
+                st.session_state["flow_lab_extracted"] = True
+                st.session_state["flow_lab_url"] = get_root_url_from_content_file(s3, bucket, lab_choice) or ""
+                st.session_state["flow_editor_url"] = normalize_lab_url_to_editor(st.session_state["flow_lab_url"])
+                st.session_state["flow_history_loaded"] = False
+                st.session_state["flow_logs_fetched"] = False
+                st.session_state["flow_rc_generated"] = s3_object_exists(s3, bucket, f"resource_configs/{lab_choice}_resource_config.json")
+                if st.session_state["flow_rc_generated"]:
+                    rc_bytes = s3_get_bytes(s3, bucket, f"resource_configs/{lab_choice}_resource_config.json")
+                    if rc_bytes:
+                        st.session_state["cloudtrail_lab_spec_content"] = rc_bytes.decode("utf-8", errors="replace")
+                st.success(f"Loaded lab: {lab_choice}")
+        else:
+            st.info("No labs found in S3 yet.")
 
-        lab_choice = st.selectbox("Choose a saved lab", options=labs, index=0)
-        if not lab_choice:
-            st.stop()
+    # ── S3 Browser ────────────────────────────────────────────────────────────
+    with st.expander("🔎 Browse S3 files", expanded=False):
+        s3_prefix_browser_ui(bucket, s3)
 
-        content_key = f"content_docs/{lab_choice}.txt"
-        policy_key  = f"policies/{lab_choice}.json"
-        prescript_key   = f"prescript/{lab_choice}.json"
+    st.divider()
 
-        colA, colB, colC = st.columns(3)
-        with colA:
-            if s3_object_exists(s3, bucket, content_key):
-                data = s3_get_bytes(s3, bucket, content_key)
-                st.download_button("Download content (.txt)", data=data, file_name=f"{lab_choice}.txt", mime="text/plain", key=f"triplet_content_{lab_choice}")
-        with colB:
-            if s3_object_exists(s3, bucket, policy_key):
-                data = s3_get_bytes(s3, bucket, policy_key)
-                st.download_button("Download policy (.json)", data=data, file_name=f"{lab_choice}.json", mime="application/json", key=f"triplet_policy_{lab_choice}")
-            else:
-                st.caption("No policy JSON")
-        with colC:
-            if s3_object_exists(s3, bucket, prescript_key):
-                data = s3_get_bytes(s3, bucket, prescript_key)
-                st.download_button("Download prescript (.json)", data=data, file_name=f"{lab_choice}.json", mime="application/json", key=f"triplet_prescript_{lab_choice}")
-            else:
-                st.caption("No prescript JSON")
-
-        s3_view_lab_triplet_ui(bucket, s3, lab_choice)
-
-        # Execution logs
-        derived_root = get_root_url_from_content_file(s3, bucket, lab_choice)
-        cloudtrail_section_ui(
-            bucket=bucket,
-            s3=s3,
-            lab_name=lab_choice,
-            default_editor_url=derived_root,
-            cookie_header=cookie_header
+    # ── PRIMARY INPUTS: URL + User ID + IAM username ──────────────────────────
+    st.subheader("Analyze a Lab Session")
+    col1, col2, col3 = st.columns([3, 1, 1])
+    with col1:
+        lab_url_input = st.text_input(
+            "Lab URL (published or editor link)",
+            placeholder="https://www.educative.io/collection/page/.../cloudlab  or  .../editor/cloudlabeditor/...",
+            value=st.session_state["flow_lab_url"],
+            key="input_lab_url",
+        )
+    with col2:
+        user_id_input = st.text_input(
+            "Learner ID",
+            value=st.session_state.get("flow_user_id", ""),
+            placeholder="user_123",
+            key="input_user_id",
+        )
+    with col3:
+        iam_username_input = st.text_input(
+            "IAM Username (optional)",
+            value=st.session_state.get("flow_iam_username", ""),
+            placeholder="e.g. lab-user-abc",
+            help="Leave blank if the lab does not use a dedicated IAM user. "
+                 "When provided, appends &iam_username=... to the CloudTrail log API call.",
+            key="input_iam_username",
         )
 
-        # Resource config (single-call)
-        generate_resource_config_section(bucket=bucket, s3=s3, lab_name=lab_choice)
+    # ── Options checkboxes ────────────────────────────────────────────────────
+    st.markdown("**Options**")
+    opt_col1, opt_col2 = st.columns(2)
+    with opt_col1:
+        opt_force_extract = st.checkbox(
+            "🔄 Extract latest content for the lab",
+            value=st.session_state.get("flow_opt_force_extract", False),
+            key="opt_force_extract",
+            help="Re-runs lab extraction and regenerates the resource configuration file, "
+                 "even if they already exist in S3.",
+        )
+    with opt_col2:
+        opt_fetch_validation = st.checkbox(
+            "✅ Fetch attempt validation results",
+            value=st.session_state.get("flow_opt_fetch_validation", False),
+            key="opt_fetch_validation",
+            help="Calls the validation API for the selected attempt and shows per-task scores and messages.",
+        )
+
+    # ── Detect input changes → reset flow guard ───────────────────────────────
+    inputs_changed = (
+        lab_url_input         != st.session_state["flow_lab_url"]
+        or user_id_input      != st.session_state.get("flow_user_id", "")
+        or iam_username_input != st.session_state.get("flow_iam_username", "")
+    )
+    if inputs_changed:
+        prev_iam = st.session_state.get("flow_iam_username", "")
+        st.session_state["flow_iam_username"] = iam_username_input
+        st.session_state["flow_user_id"]      = user_id_input
+        st.session_state["flow_lab_url"]      = lab_url_input
+        editor_url = normalize_lab_url_to_editor(lab_url_input)
+        st.session_state["flow_editor_url"]   = editor_url
+        if lab_url_input != st.session_state.get("_prev_lab_url", ""):
+            for k in ("flow_lab_extracted", "flow_history_loaded", "flow_logs_fetched",
+                      "flow_rc_generated", "flow_error_analysis_done", "flow_compliance_done",
+                      "flow_validation_fetched", "flow_started"):
+                st.session_state[k] = False
+            st.session_state["flow_attempts"]         = []
+            st.session_state["flow_selected_attempt"] = None
+            st.session_state["flow_validation_data"]  = None
+        elif iam_username_input != prev_iam:
+            for k in ("flow_logs_fetched", "flow_error_analysis_done",
+                      "flow_compliance_done", "flow_validation_fetched"):
+                st.session_state[k] = False
+            st.session_state["flow_validation_data"] = None
+        st.session_state["_prev_lab_url"] = lab_url_input
+
+    # Sync option flags
+    st.session_state["flow_opt_force_extract"]    = opt_force_extract
+    st.session_state["flow_opt_fetch_validation"] = opt_fetch_validation
+
+    # ── Start Analysis button ─────────────────────────────────────────────────
+    can_start = bool(lab_url_input.strip() and user_id_input.strip())
+    if st.button(
+        "▶ Start Analysis",
+        type="primary",
+        disabled=not can_start,
+        key="btn_start_flow",
+        help="Fill in Lab URL and Learner ID to enable.",
+    ):
+        for k in ("flow_lab_extracted", "flow_history_loaded", "flow_logs_fetched",
+                  "flow_rc_generated", "flow_error_analysis_done", "flow_compliance_done",
+                  "flow_validation_fetched"):
+            st.session_state[k] = False
+        st.session_state["flow_attempts"]         = []
+        st.session_state["flow_selected_attempt"] = None
+        st.session_state["flow_validation_data"]  = None
+        st.session_state["flow_started"]          = True
+        st.rerun()
+
+    if not st.session_state.get("flow_started"):
+        st.info("Fill in the fields above and click **▶ Start Analysis** to begin.")
         return
 
-    # =============== Extract new or refresh ===============
-    with st.form("extract_form"):
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            root_url = st.text_input("Lab Landing URL", placeholder="https://www.educative.io/cloudlabs/...", value="")
-        with col2:
-            lab_name = st.text_input("Lab Name (used for filenames)", placeholder="my_aws_lab", value="")
+    # ── Flow is now running ───────────────────────────────────────────────────
+    lab_url      = st.session_state["flow_lab_url"].strip()
+    user_id      = st.session_state["flow_user_id"].strip()
+    iam_username = st.session_state.get("flow_iam_username", "").strip()
+    editor_url   = st.session_state["flow_editor_url"]
 
-        max_pages = st.number_input("Max pages (generic mode)", min_value=1, max_value=2000, value=50, step=1)
-        same_path_only = st.checkbox("Restrict to same path (generic)", value=True)
-        delay = st.number_input("Request delay (s, generic)", min_value=0.0, max_value=5.0, value=0.3, step=0.1)
+    if not lab_url or not user_id:
+        st.info("Enter a Lab URL and Learner ID above to begin.")
+        return
 
-        st.divider()
-        edu_mode = st.checkbox("Educative CloudLabs mode", value=True)
-        use_playwright = st.checkbox("Use headless browser (Playwright, recommended)", value=True)
-        timeout_ms = st.number_input("Playwright timeout (ms)", min_value=2000, max_value=60000, value=20000, step=1000)
-        debug = st.checkbox("Debug output", value=False)
+    ids = parse_editor_ids(lab_url)
+    if not ids:
+        st.error("Could not extract lab IDs from URL. Please check the URL format.")
+        return
 
-        extra_headers = None
-        submitted = st.form_submit_button("Extract & Save to S3")
+    # ── STEP 1: Extract lab — respect flow_opt_force_extract option ──────────
+    force_extract = st.session_state.get("flow_opt_force_extract", False)
+    if not st.session_state["flow_lab_extracted"]:
+        lab_id = _lab_id_from_url(lab_url)
+        cached = dynamo_get_lab(lab_id) if lab_id else None
 
-    if not submitted:
-        st.stop()
-
-    if not root_url:
-        st.warning("Please enter a URL.")
-        st.stop()
-
-    if not lab_name:
-        st.warning("Please enter a Lab Name.")
-        st.stop()
-
-    parsed = urlparse(root_url)
-    if parsed.scheme not in ("http", "https"):
-        st.error("URL must start with http:// or https://")
-        st.stop()
-
-    # Prefer Playwright for Educative pages
-    if edu_mode and use_playwright:
-        try:
-            ensure_chromium_installed()
-            with st.status("Rendering & extracting via Playwright...", expanded=debug) as status:
-                try:
-                    import subprocess, sys
-                    try:
-                        from playwright.sync_api import sync_playwright  # noqa
-                    except Exception:
-                        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-                        from playwright.sync_api import sync_playwright
-                    from playwright.sync_api import sync_playwright
-                except Exception as e:
-                    raise RuntimeError("Playwright not installed. Run: pip install playwright && playwright install chromium") from e
-
-                links: List[TaskLink] = []
-                arts: List[TaskArtifact] = []
-                landing_artifact: Optional[TaskArtifact] = None
-
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    context = browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
-                    cookie_value = ""
-                    if cookie_header:
-                        line = cookie_header
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            if k.strip().lower() == "cookie":
-                                cookie_value = v.strip()
-                        else:
-                            cookie_value = line.strip()
-                    if cookie_value:
-                        context.add_cookies(parse_cookie_header_to_playwright_cookies(cookie_value, root_url))
-
-                    page = context.new_page()
-                    page.set_default_timeout(int(timeout_ms))
-
-                    # LANDING
-                    page.goto(root_url, wait_until="domcontentloaded")
-                    try:
-                        page.wait_for_load_state("networkidle")
-                    except Exception:
-                        pass
-
-                    landing_slate = pw_get_slate_text(page)
-                    ace_vals = pw_get_all_ace_values(page)
-                    landing_blocks: List[Dict[str, str]] = [{"type": "ace", "content": v} for v in ace_vals if str(v).strip()]
-                    landing_title = page.title() or root_url
-                    landing_artifact = TaskArtifact(url=root_url, title=landing_title, slate_text=landing_slate, code_blocks=landing_blocks)
-
-                    # Collect task links
-                    anchors = page.eval_on_selector_all(
-                        'a[href*="cloudlabeditor"]',
-                        '''els => els.map(el => {
-                            function categoryOf(node){
-                              let p = node;
-                              for (let i=0;i<20 && p;i++){
-                                const s = p.querySelector && p.querySelector('span.text-xl');
-                                if (s && s.textContent.trim()) return s.textContent.trim();
-                                p = p.parentElement;
-                              }
-                              return null;
-                            }
-                            return {
-                              href: el.getAttribute('href') || '',
-                              title: (el.textContent || '').trim(),
-                              category: categoryOf(el)
-                            };
-                        })'''
-                    )
-                    for a in anchors:
-                        href_abs = normalize_url(root_url, a.get("href", ""))
-                        if href_abs:
-                            links.append(TaskLink(category=a.get("category"), title=a.get("title", ""), href=href_abs))
-
-                    if not links:
-                        html = page.content() or ""
-                        for href in re.findall(r"/(?:editor/)?cloudlabeditor/[0-9]+/[0-9]+/[0-9]+/[0-9]+", html):
-                            href_abs = normalize_url(root_url, href)
-                            if href_abs:
-                                links.append(TaskLink(category=None, title="", href=href_abs))
-
-                    # PER-TASK PAGES
-                    for tl in links:
-                        try:
-                            page.goto(tl.href, wait_until="domcontentloaded")
-                            try:
-                                page.wait_for_load_state("networkidle")
-                            except Exception:
-                                pass
-                            slate_text = pw_get_slate_text(page)
-                            per_task_code_vals = pw_get_all_ace_values(page)
-                            code_blocks: List[Dict[str, str]] = [{"type": "ace", "content": v} for v in per_task_code_vals if str(v).strip()]
-                            title = tl.title or (page.title() or tl.href)
-                            arts.append(TaskArtifact(url=tl.href, title=title, slate_text=slate_text, code_blocks=code_blocks))
-                            time.sleep(0.2)
-                        except Exception:
-                            arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
-
-                    context.close()
-                    browser.close()
-
-                status.update(label=f"Playwright extracted {len(links)} task link(s)", state="complete")
-
-            # Write three files to S3
-            content_key, policy_key, prescript_key = s3_write_outputs_to_folders(
-                s3=s3,
-                bucket=bucket,
-                lab_name=lab_name,
-                root_url=root_url,
-                landing=landing_artifact,
-                tasks=arts,
+        if cached and not force_extract:
+            # Lab exists in DynamoDB and user did NOT request fresh extraction
+            st.info(
+                f"📋 Lab **{cached.get('lab_display_name', cached.get('lab_s3_name', lab_id))}** "
+                f"was last extracted on `{cached.get('extracted_at', 'unknown')}`. Using cached version."
             )
-
-            st.success("Saved files to S3.")
-            content_bytes = s3_get_bytes(s3, bucket, content_key)
-            if content_bytes:
-                st.download_button("Download lab content (.txt)", data=content_bytes, file_name=pathlib.Path(content_key).name, mime="text/plain")
-
-            if policy_key and s3_object_exists(s3, bucket, policy_key):
-                policy_bytes = s3_get_bytes(s3, bucket, policy_key)
-                st.download_button("Download policy (.json)", data=policy_bytes, file_name=pathlib.Path(policy_key).name, mime="application/json")
-            else:
-                st.info("No policy JSON found on the landing page (first code block).")
-
-            if prescript_key and s3_object_exists(s3, bucket, prescript_key):
-                presc_bytes = s3_get_bytes(s3, bucket, prescript_key)
-                st.download_button("Download prescript (.json)", data=presc_bytes, file_name=pathlib.Path(prescript_key).name, mime="application/json")
-            else:
-                st.info("No prescript/template JSON found on the landing page (second code block).")
-
-            st.divider()
-            st.markdown("### View saved files")
-            lab_sanitized = sanitize_lab_name(lab_name)
-            s3_view_lab_triplet_ui(bucket, s3, lab_sanitized)
-
-            # Execution Logs
-            cloudtrail_section_ui(
-                bucket=bucket,
-                s3=s3,
-                lab_name=lab_sanitized,
-                default_editor_url=root_url,
-                cookie_header=cookie_header
-            )
-
-            # Resource config (single-call)
-            generate_resource_config_section(bucket=bucket, s3=s3, lab_name=lab_sanitized or lab_name)
-            return
-        except Exception as e:
-            st.error(f"Playwright mode failed: {e}")
-            st.info("Run: pip install playwright && playwright install chromium. You can also try Requests fallback below.")
-
-    # -----------------------------
-    # Educative (Requests fallback)
-    # -----------------------------
-    session = build_session(extra_headers)
-
-    if edu_mode and not use_playwright:
-        st.subheader("Educative (Requests fallback)")
-        if cookie_header:
-            cookie_val = cookie_header
-            if ":" in cookie_val:
-                _, cookie_val = cookie_val.split(":", 1)
-            session.headers["Cookie"] = cookie_val.strip()
-
-        try:
-            resp = session.get(root_url, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            st.error(f"Failed to fetch landing page: {e}")
-            st.stop()
-
-        landing_artifact = educative_extract_task_requests(resp.text, root_url)
-        task_links = educative_collect_task_links_requests(root_url, resp.text, debug=False)
-        if not task_links:
-            st.error("No task links were found. The page likely requires JS. Try Playwright mode with a Cookie.")
-            st.stop()
-
-        st.success(f"Found {len(task_links)} task link(s). Fetching content...")
-        arts: List[TaskArtifact] = []
-        progress = st.progress(0.0)
-        for i, tl in enumerate(task_links, start=1):
-            try:
-                r = session.get(tl.href, timeout=45)
-                if r.status_code >= 400:
-                    arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
+            final_name    = cached["lab_s3_name"]
+            display_name  = cached.get("lab_display_name", final_name)
+            cached_editor = cached.get("root_url", editor_url)
+            st.session_state["flow_lab_name"]          = final_name
+            st.session_state["flow_lab_display_name"]  = display_name
+            st.session_state["flow_editor_url"]        = cached_editor
+            st.session_state["flow_lab_extracted"]     = True
+            st.session_state["_flow_force_reextract"]  = False
+            sel = {
+                "content_key":   f"content_docs/{final_name}.txt",
+                "policy_key":    f"policies/{final_name}.json",
+                "prescript_key": f"prescript/{final_name}.json",
+            }
+            hydrate_selected_lab_assets_into_session(bucket, s3, sel)
+            # Load resource config if already generated (no regeneration needed)
+            rc_key = f"resource_configs/{final_name}_resource_config.json"
+            if s3_object_exists(s3, bucket, rc_key):
+                rc_bytes = s3_get_bytes(s3, bucket, rc_key)
+                if rc_bytes:
+                    st.session_state["cloudtrail_lab_spec_content"] = rc_bytes.decode("utf-8", errors="replace")
+                    st.session_state["flow_rc_generated"] = True
+            st.success(f"✅ Loaded from cache: **{display_name}**")
+        else:
+            # Either first time OR user checked "Extract latest content"
+            label = "⚙️ Step 1 — Re-extracting lab content…" if (cached and force_extract) else "⚙️ Step 1 — Extracting lab content…"
+            st.session_state["_flow_force_reextract"] = force_extract
+            if force_extract:
+                st.session_state["flow_rc_generated"] = False  # force RC regeneration too
+            with st.status(label, expanded=True) as status:
+                ok = _auto_extract_lab(s3=s3, bucket=bucket, root_url=editor_url,
+                                       cookie_header=cookie_header, status_container=status)
+                if ok:
+                    status.update(label=f"✅ Lab extracted: {st.session_state['flow_lab_display_name']}", state="complete")
                 else:
-                    art = educative_extract_task_requests(r.text, tl.href)
-                    if tl.title and (not art.title or art.title == tl.href):
-                        art.title = tl.title
-                    arts.append(art)
-            except Exception:
-                arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
-            progress.progress(i / max(1, len(task_links)))
+                    status.update(label="❌ Lab extraction failed", state="error")
+                    return
 
-        content_key, policy_key, prescript_key = s3_write_outputs_to_folders(
-            s3=s3,
-            bucket=bucket,
-            lab_name=lab_name,
-            root_url=root_url,
-            landing=landing_artifact,
-            tasks=arts,
-        )
+    lab_name = st.session_state["flow_lab_name"]
+    display_name = st.session_state["flow_lab_display_name"]
+    st.success(f"📚 Lab: **{display_name}**")
 
-        st.success("Saved files to S3.")
-        content_bytes = s3_get_bytes(s3, bucket, content_key)
-        if content_bytes:
-            st.download_button("Download lab content (.txt)", data=content_bytes, file_name=pathlib.Path(content_key).name, mime="text/plain")
-        if policy_key and s3_object_exists(s3, bucket, policy_key):
-            st.download_button("Download policy (.json)", data=s3_get_bytes(s3, bucket, policy_key), file_name=pathlib.Path(policy_key).name, mime="application/json")
-        else:
-            st.info("No policy JSON found on the landing page (first code block).")
-        if prescript_key and s3_object_exists(s3, bucket, prescript_key):
-            st.download_button("Download prescript (.json)", data=s3_get_bytes(s3, bucket, prescript_key), file_name=pathlib.Path(prescript_key).name, mime="application/json")
-        else:
-            st.info("No prescript/template JSON found on the landing page (second code block).")
+    # ── STEP 2: Fetch attempt history ─────────────────────────────────────────
+    if not st.session_state["flow_history_loaded"]:
+        with st.status("⚙️ Step 2 — Fetching attempt history…", expanded=True) as status:
+            attempts = _auto_fetch_history(editor_url=editor_url, user_id=user_id, cookie_header=cookie_header)
+            st.session_state["flow_attempts"] = attempts
+            st.session_state["flow_history_loaded"] = True
+            status.update(label=f"✅ Found {len(attempts)} attempt(s)", state="complete")
 
-        st.divider()
-        st.markdown("### View saved files")
-        lab_sanitized = sanitize_lab_name(lab_name)
-        s3_view_lab_triplet_ui(bucket, s3, lab_sanitized)
-
-        # Execution Logs
-        cloudtrail_section_ui(
-            bucket=bucket,
-            s3=s3,
-            lab_name=lab_sanitized,
-            default_editor_url=root_url,
-            cookie_header=cookie_header
-        )
-
-        # Resource config (single-call)
-        generate_resource_config_section(bucket=bucket, s3=s3, lab_name=lab_sanitized or lab_name)
+    attempts = st.session_state["flow_attempts"]
+    if not attempts:
+        st.warning("No attempts found for this learner on this lab.")
         return
 
-    # -----------------------------
-    # Generic crawl (fallback)
-    # -----------------------------
-    st.subheader("Generic crawl (fallback)")
-    with st.status("Crawling & extracting...", expanded=True) as status:
-        st.write(f"Root: {root_url}")
-        pages = crawl_generic(root_url, session, max_pages=int(max_pages), same_path_only=same_path_only, delay=float(delay))
-        status.update(label=f"Parsed {len(pages)} page(s)", state="complete")
+    # ── STEP 3: Let user pick an attempt ──────────────────────────────────────
+    st.subheader("Select Attempt to Analyze")
+    attempt_rows = []
+    for a in attempts:
+        row = {"attempt_id": a.get("attempt_id", ""), "started": a.get("started", ""), "ended": a.get("ended", "")}
+        if a.get("meta"):
+            row.update(a["meta"])
+        attempt_rows.append(row)
+    st.dataframe(attempt_rows, use_container_width=True)
 
-    if not pages:
-        st.error("No pages were parsed. Check access or increase the max pages.")
-    else:
-        payload = io.StringIO()
-        payload.write("LAB CONTENT EXTRACT (GENERIC)\n")
-        payload.write(f"Root URL: {root_url}\n")
-        payload.write(f"Total pages: {len(pages)}\n")
-        payload.write("=" * 80 + "\n\n")
-        for i, (url, text) in enumerate(pages.items(), start=1):
-            payload.write(f"[Page {i}] {url}\n")
-            payload.write("-" * 80 + "\n")
-            payload.write(text.strip() + "\n\n")
+    attempt_ids = [a.get("attempt_id", "") for a in attempts if a.get("attempt_id")]
+    if not attempt_ids:
+        st.warning("No attempt IDs found in history response.")
+        return
 
-        lab = sanitize_lab_name(lab_name or f"generic_{hashlib.sha256(root_url.encode('utf-8')).hexdigest()[:10]}")
-        key = f"content_docs/{lab}.txt"
-        s3_put_text(s3, bucket, key, payload.getvalue(), "text/plain")
-        data = s3_get_bytes(s3, bucket, key)
-        st.download_button(label=f"Download {pathlib.Path(key).name}", data=data, file_name=pathlib.Path(key).name, mime="text/plain")
+    # Default to last (most recent) attempt
+    default_idx = len(attempt_ids) - 1
+    current_sel = st.session_state.get("flow_selected_attempt")
+    current_idx = attempt_ids.index(current_sel) if (current_sel in attempt_ids) else default_idx
 
+    chosen_attempt_id = st.selectbox("Choose attempt to analyze", options=attempt_ids,
+                                     index=current_idx, key="attempt_selector")
+
+    # When selection changes, reset only attempt-specific flags (logs + analyses).
+    # RC is per-lab, not per-attempt — never reset it here.
+    if chosen_attempt_id != st.session_state.get("flow_selected_attempt"):
+        st.session_state["flow_selected_attempt"] = chosen_attempt_id
+        st.session_state["flow_logs_fetched"]          = False
+        st.session_state["flow_error_analysis_done"]   = False
+        st.session_state["flow_compliance_done"]       = False
+        st.session_state["flow_error_analysis_key"]    = None
+        st.session_state["flow_compliance_key"]        = None
+        st.session_state["flow_validation_fetched"]    = False
+        st.session_state["flow_validation_data"]       = None
+
+    chosen_attempt = next((a for a in attempts if a.get("attempt_id") == chosen_attempt_id), {})
+
+    # ── STEP 4: Fetch execution logs (cached in S3 if already present) ────────
+    if not st.session_state["flow_logs_fetched"]:
+        with st.status("⚙️ Step 4 — Loading execution logs…", expanded=True) as status:
+            log_key = _auto_fetch_logs(
+                s3=s3, bucket=bucket, editor_url=editor_url, user_id=user_id,
+                attempt=chosen_attempt, lab_name=lab_name, cookie_header=cookie_header,
+                iam_username=iam_username,
+            )
+            if log_key:
+                st.session_state["flow_execution_log_key"] = log_key
+                st.session_state["flow_logs_fetched"] = True
+                # Also initialise cloudtrail organised logs
+                raw_logs = s3_get_bytes(s3, bucket, log_key)
+                if raw_logs:
+                    class _MockFile:
+                        def __init__(self, data): self.data = data; self.pos = 0
+                        def read(self, n=None):
+                            if n is None: chunk = self.data[self.pos:]; self.pos = len(self.data); return chunk
+                            chunk = self.data[self.pos:self.pos+n]; self.pos += n; return chunk
+                        def seek(self, p): self.pos = p
+                    st.session_state["cloudtrail_organized_logs"] = load_and_process_logs(_MockFile(raw_logs))
+                    st.session_state["cloudtrail_selected_log_file"] = log_key
+                status.update(label="✅ Execution logs fetched", state="complete")
+            else:
+                status.update(label="⚠️ Could not fetch execution logs", state="error")
+
+    # ── STEP 5: Resource config (skip if already in S3, force only on re-extract) ──
+    if not st.session_state["flow_rc_generated"]:
+        force_rc = st.session_state.get("_flow_force_reextract", False)
+        with st.status(
+            "⚙️ Step 5 — Loading resource configuration…" if not force_rc
+            else "⚙️ Step 5 — Re-generating resource configuration…",
+            expanded=True
+        ) as status:
+            rc_key = _auto_generate_resource_config(s3=s3, bucket=bucket, lab_name=lab_name, force=force_rc)
+            if rc_key:
+                st.session_state["flow_resource_config_key"] = rc_key
+                st.session_state["flow_rc_generated"] = True
+                was_cached = not force_rc and s3_object_exists(s3, bucket, rc_key)
+                status.update(
+                    label="✅ Resource config loaded from S3" if was_cached else "✅ Resource config generated",
+                    state="complete"
+                )
+            else:
+                status.update(label="⚠️ Resource config generation failed (check OpenAI key)", state="error")
+
+    # ── STEP 6 & 7: Auto-run error analysis + compliance (with S3 caching) ───
+    _run_cached_analyses(s3=s3, bucket=bucket, lab_name=lab_name,
+                         user_id=user_id, attempt_id=chosen_attempt_id,
+                         iam_username=iam_username)
+
+    # ── Summary of loaded data ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("📋 Session Summary")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.session_state.get("lab_content"):
+            st.success("✅ Lab content loaded")
+        else:
+            st.warning("⚠️ Lab content not loaded")
+    with c2:
+        if st.session_state.get("flow_logs_fetched"):
+            st.success(f"✅ Logs: `{st.session_state.get('flow_execution_log_key', '').split('/')[-1]}`")
+        else:
+            st.warning("⚠️ Logs not loaded")
+    with c3:
+        if st.session_state.get("flow_rc_generated"):
+            st.success("✅ Resource config generated")
+        else:
+            st.warning("⚠️ Resource config not generated")
+
+    # ── STEP 8: Attempt validation results (only if option is checked) ────────
+    if st.session_state.get("flow_opt_fetch_validation"):
         st.divider()
-        st.markdown("### View saved file")
-        view_s3_file_inline(s3, bucket, key)
+        st.subheader("🔎 Attempt Validation Results")
 
-        # Logs section (optional)
-        cloudtrail_section_ui(
-            bucket=bucket,
-            s3=s3,
-            lab_name=lab,
-            default_editor_url="",
-            cookie_header=cookie_header
-        )
+        if not st.session_state.get("flow_validation_fetched"):
+            validation_url = build_validation_api_url(editor_url, user_id, chosen_attempt_id)
+            if not validation_url:
+                st.warning("Could not build validation API URL — check the lab URL format.")
+            else:
+                with st.status("⚙️ Step 8 — Fetching validation results…", expanded=True) as vstatus:
+                    try:
+                        vdata = fetch_validation_results(validation_url, cookie_header)
+                        st.session_state["flow_validation_data"]    = vdata
+                        st.session_state["flow_validation_fetched"] = True
+                        vstatus.update(label="✅ Validation results fetched", state="complete")
+                    except Exception as e:
+                        vstatus.update(label=f"⚠️ Validation fetch failed: {e}", state="error")
+
+        if st.session_state.get("flow_validation_fetched") and st.session_state.get("flow_validation_data"):
+            _display_validation_results(st.session_state["flow_validation_data"])
+            if st.button("🔄 Re-fetch validation results", key="refetch_validation_btn"):
+                st.session_state["flow_validation_fetched"] = False
+                st.session_state["flow_validation_data"]    = None
+                st.rerun()
+
 
 import chromadb
 from chromadb.config import Settings as ChromaClientSettings
