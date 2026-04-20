@@ -1,12 +1,12 @@
 """
-Comprehensive Lab Extractor & CloudTrail Analyzer — Educative CloudLabs + S3 + Gemini AI
+Comprehensive Lab Extractor & CloudTrail Analyzer — Educative CloudLabs + S3 + Claude 4.6 (Bedrock)
 
 This merged application provides:
 1. Lab content extraction from Educative CloudLabs (Playwright + Requests)
 2. S3 storage for content, policies, prescripts, and execution logs
 3. CloudTrail log processing and analysis
-4. Gemini AI-powered lab issue analysis and resource compliance checking
-5. Resource configuration extraction using OpenAI
+4. Claude 4.6 (Bedrock) AI-powered lab issue analysis and resource compliance checking (GPT fallback)
+5. Resource configuration extraction using Claude 4.6 (GPT fallback)
 
 Features:
 - Full lab content extraction with ACE editor support
@@ -88,7 +88,7 @@ def ensure_chromium_installed():
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright"))
     # This command is safe to run repeatedly; it will no-op if already installed
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-# --- Google Gemini
+# --- Google Generative AI (legacy)
 try:
     import google.generativeai as genai
 except Exception:
@@ -775,19 +775,12 @@ def display_log_details(organized_logs):
                 display_event_details(log)
 
 # -----------------------------
-# Gemini AI Analysis
+# LLM Analysis (Claude primary, GPT fallback)
 # -----------------------------
 async def analyze_lab_with_gemini(organized_logs, lab_spec_content):
-    """Analyze lab issues using Gemini AI with failure logs."""
+    """Analyze lab issues using Claude (Bedrock) with GPT fallback."""
     st.info("Sending data to Model for analysis...")
     try:
-        if "openaikey" not in st.secrets:
-            st.error("OpenAI API key not found.")
-            return
-
-        genai.configure(api_key=st.secrets["openaikey"].get("key"))
-        model = "gpt-4.1"
-
         summarized_logs = {}
         for source, events in organized_logs.items():
             error_events = [event for event in events if event.get('cloud_trail_event', {}).get('errorCode')]
@@ -830,49 +823,29 @@ CloudTrail Error Events Summary:
 
 """.strip()
         try:
-            with st.spinner("Calling GPT-4.1..."):
-                client = _openai_client()
-                resp = client.chat.completions.create(
-                    model="gpt-4.1",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": prompt},
-                    ],
+            with st.spinner("Calling Claude 4.6..."):
+                out, model_used = call_text_with_fallback(
+                    system_msg,
+                    prompt,
                     temperature=0.2,
+                    max_tokens=2048,
+                    openai_model="gpt-4.1",
                 )
-            out = (resp.choices[0].message.content or "").strip()
             if not out:
-                print("In if not out stage")
-                st.warning("No response from GPT-4.1.")
+                st.warning("No response from the model.")
                 return
-            else:
-                print ("in else case and should print response",out)
-                st.session_state["gemini_lab_analysis"] = out
-                st.success("Resource creation compliance analysis generated with GPT-4.1.")
+            st.session_state["gemini_lab_analysis"] = out
+            st.success(f"Lab issue analysis generated with {model_used}.")
         except Exception as e:
-            print("Error changing the model \n", e)
-            st.error(f"GPT API not responding: {e}")
-
-        # response = model.generate_content(prompt)
-        # if response.text:
-        #     st.session_state["gemini_lab_analysis"] = response.text
-        # else:
-        #     st.warning("No response from Gemini.")
+            st.error(f"Model API not responding: {e}")
     except Exception as e:
         st.error(f"API error: {e}")
 
 
 async def analyze_resource_creation(organized_logs, lab_spec_content):
-    """Analyze resource creation compliance using Gemini AI."""
+    """Analyze resource creation compliance using Claude (Bedrock) with GPT fallback."""
     st.info("Analyzing resource creation compliance...")
     try:
-        if "openaikey" not in st.secrets:
-            st.error("OpenAI API key not found.")
-            return
-
-        genai.configure(api_key=st.secrets["openaikey"].get("key"))
-        model = "gpt-4.1"
-
         creation_logs = {
             source: [event for event in events if any(x in event.get("event_name", "") for x in ("Create", "Authorize","Run","Publish","Put","Register","Attach", "Update"))]
             for source, events in organized_logs.items()
@@ -930,33 +903,21 @@ Please provide your analysis in the following format:
    - List any required resources that were not found in the creation events
 """.strip()
         try:
-            with st.spinner("Calling GPT-4.1..."):
-                client = _openai_client()
-                resp = client.chat.completions.create(
-                    model="gpt-4.1",
-                    messages=[
-                        {"role": "system", "content": system_msg},
-                        {"role": "user", "content": creation_prompt},
-                    ],
+            with st.spinner("Calling Claude 4.6..."):
+                out, model_used = call_text_with_fallback(
+                    system_msg,
+                    creation_prompt,
                     temperature=0.2,
+                    max_tokens=2048,
+                    openai_model="gpt-4.1",
                 )
-            out = (resp.choices[0].message.content or "").strip()
             if not out:
-                print("In if not out stage")
-                st.warning("No response from GPT-4.1.")
+                st.warning("No response from the model.")
                 return
-            else:
-                print ("in else case and should print response",out)
-                st.session_state["gemini_resource_analysis"] = out
-                st.success("Resource creation compliance analysis generated with GPT-4.1.")
+            st.session_state["gemini_resource_analysis"] = out
+            st.success(f"Resource creation compliance analysis generated with {model_used}.")
         except Exception as e:
-            print("Error changing the model \n", e)
-
-        # response = model.generate_content(creation_prompt)
-        # if response.text:
-        #     st.session_state["gemini_resource_analysis"] = response.text
-        # else:
-        #     st.warning("No response from Gemini.")
+            st.error(f"Model API not responding: {e}")
     except Exception as e:
         st.error(f"API error: {e}")
 
@@ -1633,14 +1594,155 @@ def parse_attempts_from_history(history_json: Any) -> List[Dict[str, Any]]:
 # cloudtrail_section_ui removed — logic handled inside lab_extractor_module auto-flow
 
 # -----------------------------
-# OpenAI single-call extraction
+# Bedrock (Claude) + OpenAI helpers
 # -----------------------------
+BEDROCK_DEFAULT_MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
+BEDROCK_ANTHROPIC_VERSION = "bedrock-2023-05-31"
+
+def _bedrock_settings() -> Dict[str, Optional[str]]:
+    cfg = st.secrets.get("aws_bedrock") or {}
+    return {
+        "region": cfg.get("region") or os.getenv("AWS_BEDROCK_REGION"),
+        "access_key_id": cfg.get("access_key_id") or os.getenv("AWS_BEDROCK_ACCESS_KEY_ID"),
+        "secret_access_key": cfg.get("secret_access_key") or os.getenv("AWS_BEDROCK_SECRET_ACCESS_KEY"),
+        "session_token": cfg.get("session_token") or os.getenv("AWS_BEDROCK_SESSION_TOKEN"),
+        # model_id can be a base model ID, inference profile ID, or an inference profile ARN.
+        "model_id": cfg.get("model_id") or os.getenv("AWS_BEDROCK_MODEL_ID") or BEDROCK_DEFAULT_MODEL_ID,
+    }
+
+def _bedrock_client() -> Optional[Any]:
+    if not boto3:
+        st.error("boto3 is required for Bedrock but is not available.")
+        return None
+    settings = _bedrock_settings()
+    if not settings["region"] or not settings["access_key_id"] or not settings["secret_access_key"]:
+        return None
+    kwargs: Dict[str, Any] = {
+        "region_name": settings["region"],
+        "aws_access_key_id": settings["access_key_id"],
+        "aws_secret_access_key": settings["secret_access_key"],
+    }
+    if settings["session_token"]:
+        kwargs["aws_session_token"] = settings["session_token"]
+    if BotoConfig:
+        kwargs["config"] = BotoConfig(retries={"max_attempts": 3, "mode": "standard"})
+    return boto3.client("bedrock-runtime", **kwargs)
+
+def _extract_bedrock_text(payload: Dict[str, Any]) -> str:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("content"), list):
+            return "".join(
+                part.get("text", "")
+                for part in payload["content"]
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        if payload.get("output_text"):
+            return payload.get("output_text") or ""
+        if payload.get("completion"):
+            return payload.get("completion") or ""
+    return ""
+
+def _call_bedrock_claude(system_prompt: str, user_prompt: str, *, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    client = _bedrock_client()
+    if not client:
+        raise RuntimeError(
+            "AWS Bedrock is not configured. Add [aws_bedrock] credentials (access_key_id, secret_access_key, region)."
+        )
+
+    settings = _bedrock_settings()
+    body = {
+        "anthropic_version": BEDROCK_ANTHROPIC_VERSION,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": user_prompt}]},
+        ],
+    }
+    if system_prompt:
+        body["system"] = system_prompt
+
+    resp = client.invoke_model(
+        modelId=settings["model_id"],
+        body=json.dumps(body),
+        contentType="application/json",
+        accept="application/json",
+    )
+    raw = json.loads(resp["body"].read().decode("utf-8"))
+    text = _extract_bedrock_text(raw).strip()
+    if not text:
+        raise RuntimeError("Claude returned an empty response.")
+    return text
+
 def _openai_client() -> Optional[OpenAI]:
     key = (st.secrets.get("openaikey") or {}).get("key")
     if not key:
         st.error("OpenAI key not found in secrets.toml under [openaikey].key")
         return None
     return OpenAI(api_key=key)
+
+def _call_openai_chat(system_prompt: str, user_prompt: str, *, model: str, temperature: float = 0.2, max_tokens: int = 2048) -> str:
+    client = _openai_client()
+    if not client:
+        raise RuntimeError("OpenAI key not configured.")
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    if user_prompt:
+        messages.append({"role": "user", "content": user_prompt})
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise RuntimeError("OpenAI returned an empty response.")
+    return text
+
+def call_text_with_fallback(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+    openai_model: str = "gpt-4.1",
+) -> Tuple[str, str]:
+    claude_error: Optional[Exception] = None
+    try:
+        text = _call_bedrock_claude(system_prompt, user_prompt, temperature=temperature, max_tokens=max_tokens)
+        return text, "Claude 4.6 (Bedrock)"
+    except Exception as e:
+        claude_error = e
+
+    try:
+        text = _call_openai_chat(
+            system_prompt,
+            user_prompt,
+            model=openai_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if claude_error:
+            st.warning(f"Claude failed; used GPT fallback. ({claude_error})")
+        return text, f"{openai_model} (fallback)"
+    except Exception as e:
+        if claude_error:
+            raise RuntimeError(f"Claude failed: {claude_error}; OpenAI failed: {e}")
+        raise
+
+def _extract_first_json_object(content: str) -> Dict[str, Any]:
+    m = re.search(r"({[\s\S]*})", content)
+    if not m:
+        return {"Resources": []}
+    try:
+        return json.loads(m.group(1))
+    except Exception:
+        return {"Resources": []}
+
+# -----------------------------
+# OpenAI single-call extraction
+# -----------------------------
 
 RC_SYSTEM_PROMPT = """You are a careful extractor. Read the provided context and extract ONLY the cloud resources that a learner is instructed to CREATE or CONFIGURE.
 
@@ -1721,14 +1823,31 @@ Return ONLY one JSON object with the required schema. No prose."""
         )
         content = resp.choices[0].message.content or ""
 
-    # Extract first JSON object from the model output
-    m = re.search(r"({[\s\S]*})", content)
-    if not m:
-        return {"Resources": []}
+    return _extract_first_json_object(content)
+
+def call_extract_with_fallback(context: str, question: str, *, model: Optional[str] = None) -> Dict[str, Any]:
+    user_prompt = f"""Context:
+{context}
+
+Question: {question}
+
+Return ONLY one JSON object with the required schema. No prose."""
+
     try:
-        return json.loads(m.group(1))
-    except Exception:
-        return {"Resources": []}
+        content = _call_bedrock_claude(
+            RC_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.2,
+            max_tokens=2048,
+        )
+        return _extract_first_json_object(content)
+    except Exception as e:
+        client = _openai_client()
+        if not client:
+            st.error("No model credentials configured for extraction. Add [aws_bedrock] or [openaikey].")
+            return {"Resources": []}
+        st.warning(f"Claude extraction failed; using GPT fallback. ({e})")
+        return call_openai_extract(client, context, question, model=model)
 
 # -----------------------------
 # Generic, service-agnostic normalizer
@@ -1897,10 +2016,6 @@ def generate_resource_config_section(*, bucket: str, s3, lab_name: str):
     if not run:
         return
 
-    client = _openai_client()
-    if not client:
-        return
-
     with st.spinner("Assembling full context…"):
         content_text = _load_text_from_s3(s3, bucket, content_key) or ""
         if not content_text.strip():
@@ -1922,7 +2037,7 @@ def generate_resource_config_section(*, bucket: str, s3, lab_name: str):
             context = content_text
 
     with st.spinner("Extracting resources (single model call)…"):
-        raw_payload = call_openai_extract(client, context, question)
+        raw_payload = call_extract_with_fallback(context, question)
         normalized = normalize_payload(raw_payload)
 
     rc_key = f"resource_configs/{sanitize_lab_name(lab_name)}_resource_config.json"
@@ -1979,105 +2094,160 @@ def _init_flow_state():
             st.session_state[k] = v
 
 
-def _auto_extract_lab(*, s3, bucket: str, root_url: str, cookie_header: str, status_container) -> bool:
-    """
-    Run Playwright extraction for the lab at root_url, save to S3, auto-detect lab name.
-    Returns True on success.
-    """
+def _extract_lab_playwright(root_url: str, cookie_header: str) -> Tuple[List[TaskLink], List[TaskArtifact], TaskArtifact]:
+    ensure_chromium_installed()
     try:
-        ensure_chromium_installed()
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception:
-            import subprocess, sys
-            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-            from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+        from playwright.sync_api import sync_playwright
 
+    def _run_extract(browser_type, *, launch_kwargs: Dict[str, Any]) -> Tuple[List[TaskLink], List[TaskArtifact], TaskArtifact]:
         links: List[TaskLink] = []
         arts: List[TaskArtifact] = []
         landing_artifact: Optional[TaskArtifact] = None
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
-            cookie_value = ""
-            if cookie_header:
-                line = cookie_header
-                if ":" in line:
-                    k2, v2 = line.split(":", 1)
-                    if k2.strip().lower() == "cookie":
-                        cookie_value = v2.strip()
-                else:
-                    cookie_value = line.strip()
-            if cookie_value:
-                ctx.add_cookies(parse_cookie_header_to_playwright_cookies(cookie_value, root_url))
+        browser = browser_type.launch(**launch_kwargs)
+        ctx = browser.new_context(user_agent=USER_AGENT, ignore_https_errors=True)
+        cookie_value = ""
+        if cookie_header:
+            line = cookie_header
+            if ":" in line:
+                k2, v2 = line.split(":", 1)
+                if k2.strip().lower() == "cookie":
+                    cookie_value = v2.strip()
+            else:
+                cookie_value = line.strip()
+        if cookie_value:
+            ctx.add_cookies(parse_cookie_header_to_playwright_cookies(cookie_value, root_url))
 
-            page = ctx.new_page()
-            page.set_default_timeout(20000)
+        page = ctx.new_page()
+        page.set_default_timeout(20000)
 
-            page.goto(root_url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_load_state("networkidle")
-            except Exception:
-                pass
+        page.goto(root_url, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle")
+        except Exception:
+            pass
 
-            landing_slate = pw_get_slate_text(page)
-            ace_vals = pw_get_all_ace_values(page)
-            landing_blocks = [{"type": "ace", "content": v} for v in ace_vals if str(v).strip()]
-            landing_title = page.title() or root_url
-            landing_artifact = TaskArtifact(url=root_url, title=landing_title, slate_text=landing_slate, code_blocks=landing_blocks)
+        landing_slate = pw_get_slate_text(page)
+        ace_vals = pw_get_all_ace_values(page)
+        landing_blocks = [{"type": "ace", "content": v} for v in ace_vals if str(v).strip()]
+        landing_title = page.title() or root_url
+        landing_artifact = TaskArtifact(url=root_url, title=landing_title, slate_text=landing_slate, code_blocks=landing_blocks)
 
-            anchors = page.eval_on_selector_all(
-                'a[href*="cloudlabeditor"]',
-                '''els => els.map(el => {
-                    function categoryOf(node){
-                      let p = node;
-                      for (let i=0;i<20 && p;i++){
-                        const s = p.querySelector && p.querySelector('span.text-xl');
-                        if (s && s.textContent.trim()) return s.textContent.trim();
-                        p = p.parentElement;
-                      }
-                      return null;
-                    }
-                    return {
-                      href: el.getAttribute('href') || '',
-                      title: (el.textContent || '').trim(),
-                      category: categoryOf(el)
-                    };
-                })'''
-            )
-            for a in anchors:
-                href_abs = normalize_url(root_url, a.get("href", ""))
+        anchors = page.eval_on_selector_all(
+            'a[href*="cloudlabeditor"]',
+            '''els => els.map(el => {
+                function categoryOf(node){
+                  let p = node;
+                  for (let i=0;i<20 && p;i++){
+                    const s = p.querySelector && p.querySelector('span.text-xl');
+                    if (s && s.textContent.trim()) return s.textContent.trim();
+                    p = p.parentElement;
+                  }
+                  return null;
+                }
+                return {
+                  href: el.getAttribute('href') || '',
+                  title: (el.textContent || '').trim(),
+                  category: categoryOf(el)
+                };
+            })'''
+        )
+        for a in anchors:
+            href_abs = normalize_url(root_url, a.get("href", ""))
+            if href_abs:
+                links.append(TaskLink(category=a.get("category"), title=a.get("title", ""), href=href_abs))
+
+        if not links:
+            html = page.content() or ""
+            for href in re.findall(r"/(?:editor/)?cloudlabeditor/[0-9]+/[0-9]+/[0-9]+/[0-9]+", html):
+                href_abs = normalize_url(root_url, href)
                 if href_abs:
-                    links.append(TaskLink(category=a.get("category"), title=a.get("title", ""), href=href_abs))
+                    links.append(TaskLink(category=None, title="", href=href_abs))
 
-            if not links:
-                html = page.content() or ""
-                for href in re.findall(r"/(?:editor/)?cloudlabeditor/[0-9]+/[0-9]+/[0-9]+/[0-9]+", html):
-                    href_abs = normalize_url(root_url, href)
-                    if href_abs:
-                        links.append(TaskLink(category=None, title="", href=href_abs))
-
-            for tl in links:
+        for tl in links:
+            try:
+                page.goto(tl.href, wait_until="domcontentloaded")
                 try:
-                    page.goto(tl.href, wait_until="domcontentloaded")
-                    try:
-                        page.wait_for_load_state("networkidle")
-                    except Exception:
-                        pass
-                    slate_text = pw_get_slate_text(page)
-                    per_task_code_vals = pw_get_all_ace_values(page)
-                    code_blocks = [{"type": "ace", "content": v} for v in per_task_code_vals if str(v).strip()]
-                    title = tl.title or (page.title() or tl.href)
-                    arts.append(TaskArtifact(url=tl.href, title=title, slate_text=slate_text, code_blocks=code_blocks))
-                    time.sleep(0.2)
+                    page.wait_for_load_state("networkidle")
                 except Exception:
-                    arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
+                    pass
+                slate_text = pw_get_slate_text(page)
+                per_task_code_vals = pw_get_all_ace_values(page)
+                code_blocks = [{"type": "ace", "content": v} for v in per_task_code_vals if str(v).strip()]
+                title = tl.title or (page.title() or tl.href)
+                arts.append(TaskArtifact(url=tl.href, title=title, slate_text=slate_text, code_blocks=code_blocks))
+                time.sleep(0.2)
+            except Exception:
+                arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
 
-            ctx.close()
-            browser.close()
+        ctx.close()
+        browser.close()
 
-        status_container.write(f"Extracted {len(links)} task(s).")
+        if not landing_artifact:
+            raise RuntimeError("Failed to capture landing page content.")
+        return links, arts, landing_artifact
+
+    with sync_playwright() as p:
+        attempts: List[str] = []
+        launch_variants: List[Tuple[str, Any, Dict[str, Any]]] = [
+            ("chromium", p.chromium, {"headless": True}),
+            ("chromium-channel", p.chromium, {"headless": True, "channel": "chrome"}),
+            ("firefox", p.firefox, {"headless": True}),
+            ("webkit", p.webkit, {"headless": True}),
+        ]
+        for label, browser_type, launch_kwargs in launch_variants:
+            try:
+                return _run_extract(browser_type, launch_kwargs=launch_kwargs)
+            except Exception as e:
+                attempts.append(f"{label}: {e}")
+        raise RuntimeError("Playwright failed across browsers: " + " | ".join(attempts))
+
+
+def _extract_lab_requests(root_url: str, cookie_header: str) -> Tuple[List[TaskLink], List[TaskArtifact], TaskArtifact]:
+    session = build_session(cookie_header)
+    resp = session.get(root_url, timeout=30)
+    resp.raise_for_status()
+    html = resp.text or ""
+    html_lc = html.lower()
+    if any(tok in html_lc for tok in ("sign in", "log in", "login", "create account")):
+        raise RuntimeError("Page appears to be a login screen; cookie may be invalid or expired.")
+    links = educative_collect_task_links_requests(root_url, html)
+    landing_artifact = educative_extract_task_requests(html, root_url)
+
+    arts: List[TaskArtifact] = []
+    for tl in links:
+        try:
+            r = session.get(tl.href, timeout=30)
+            r.raise_for_status()
+            arts.append(educative_extract_task_requests(r.text or "", tl.href))
+        except Exception:
+            arts.append(TaskArtifact(url=tl.href, title=tl.title or tl.href, slate_text="", code_blocks=[]))
+
+    if not links and not landing_artifact.slate_text.strip() and not landing_artifact.code_blocks:
+        raise RuntimeError("No tasks or content extracted; page may require JS rendering or valid auth.")
+    return links, arts, landing_artifact
+
+
+def _auto_extract_lab(*, s3, bucket: str, root_url: str, cookie_header: str, status_container) -> bool:
+    """
+    Run Playwright extraction for the lab at root_url; fall back to Requests if Playwright fails.
+    Saves to S3 and auto-detects lab name. Returns True on success.
+    """
+    try:
+        try:
+            links, arts, landing_artifact = _extract_lab_playwright(root_url, cookie_header)
+            status_container.write(f"Extracted {len(links)} task(s) using Playwright.")
+        except Exception as pw_err:
+            status_container.write(f"Playwright failed ({pw_err}). Falling back to Requests extraction…")
+            links, arts, landing_artifact = _extract_lab_requests(root_url, cookie_header)
+            status_container.write(f"Extracted {len(links)} task(s) using Requests fallback.")
+
+        if not arts:
+            raise RuntimeError("No tasks extracted. Check cookie validity or try re-running with fresh auth.")
 
         # Use a temporary sanitized name derived from URL IDs so we can save first
         ids = parse_editor_ids(root_url)
@@ -2207,14 +2377,11 @@ def _auto_generate_resource_config(*, s3, bucket: str, lab_name: str,
     content_key = f"content_docs/{sanitize_lab_name(lab_name)}.txt"
     if not s3_object_exists(s3, bucket, content_key):
         return None
-    client = _openai_client()
-    if not client:
-        return None
     content_text = _load_text_from_s3(s3, bucket, content_key) or ""
     if not content_text.strip():
         return None
     question = "Extract all AWS resources the learner creates/configures in this lab and their configurations as JSON."
-    raw_payload = call_openai_extract(client, content_text, question)
+    raw_payload = call_extract_with_fallback(content_text, question)
     normalized = normalize_payload(raw_payload)
     try:
         s3_put_json(s3, bucket, rc_key, normalized)
@@ -2734,7 +2901,7 @@ def lab_extractor_module():
                     state="complete"
                 )
             else:
-                status.update(label="⚠️ Resource config generation failed (check OpenAI key)", state="error")
+                status.update(label="⚠️ Resource config generation failed (check Bedrock/OpenAI credentials)", state="error")
 
     # ── STEP 6 & 7: Auto-run error analysis + compliance (with S3 caching) ───
     _run_cached_analyses(s3=s3, bucket=bucket, lab_name=lab_name,
@@ -3120,29 +3287,17 @@ def feedback_analysis_module():
         if not lab_snippets:
             lab_snippets = (st.session_state.get("lab_content") or "")
 
-        # 5) Gemini analysis
+        # 5) Model analysis (Claude primary, GPT fallback)
         try:
-            # if "openaikey" not in st.secrets:
-            #     st.error("OpenAI API key not found.")
-            #     return
-
-            # genai.configure(api_key=st.secrets["openaikey"].get("key"))
-            # model="gpt-5"
-            if "othersecrets" not in st.secrets or not st.secrets["othersecrets"].get("google_key"):
-                st.error("Google API key not found in secrets.toml under [othersecrets].google_key")
-                return
-
-            genai.configure(api_key=st.secrets["othersecrets"]["google_key"])
-            gmodel = genai.GenerativeModel("gemini-2.5-flash")
-
             policy_str = normalize_to_json_string(st.session_state.get("policy_json"))
             cfn_str = normalize_to_json_string(st.session_state.get("cloudformation_json"))
 
-            gemini_prompt = f"""
-You are a DevOps assistant. Based on the retrieved CloudTrail logs and lab context, provide a detailed analysis including:
-- Tasks executed successfully
-- Tasks that failed and reasons
-- Permissions or dependency issues (consider IAM/CloudFormation)
+            analysis_system = (
+                "You are a DevOps assistant. Based on the retrieved CloudTrail logs and lab context, "
+                "provide a detailed analysis including tasks executed successfully, tasks that failed and reasons, "
+                "and permissions or dependency issues (consider IAM/CloudFormation)."
+            )
+            analysis_prompt = f"""
 CloudTrail Log Segments:
 {log_snippets}
 
@@ -3156,46 +3311,31 @@ Lab Instructions Summary:
 {lab_snippets}
 """.strip()
 
-            with st.spinner("Analyzing logs and generating Gemini report…"):
-                # client = _openai_client()
-                # resp = client.responses.create(
-                #     model=model,
-                #     input=[
-                #         {
-                #             "role": "developer",
-                #             "content": [{"type": "input_text", "text": gpt_dev_prompt}],
-                #         },
-                #         {
-                #             "role": "user",
-                #             "content": [{"type": "input_text", "text": gemini_prompt}],
-                #         },
-                #     ],
-                # )
-                # gresp = ""
-                # if getattr(resp, "output_text", None):
-                #     gresp = resp.output_text
-                gresp = gmodel.generate_content(gemini_prompt)
+            with st.spinner("Analyzing logs and generating report…"):
+                analysis_text, _ = call_text_with_fallback(
+                    analysis_system,
+                    analysis_prompt,
+                    temperature=0.2,
+                    max_tokens=2048,
+                    openai_model="gpt-4.1",
+                )
 
-            analysis_text = (getattr(gresp, "text", None) or "").strip()
             if not analysis_text:
-                st.error("Gemini returned an empty response.")
+                st.error("Model returned an empty response.")
                 return
 
             st.session_state["gemini_feedback_analysis"] = analysis_text
 
         except Exception as e:
-            st.error(f"Gemini analysis failed: {e}")
+            st.error(f"Model analysis failed: {e}")
             return
 
-        # 6) OpenAI generation of learner + DRI responses
+        # 6) Final response generation (Claude primary, GPT fallback)
         try:
-            client = _openai_client()
-            if not client:
-                return
-
             style_samples = "\n\n".join(sample_responses)
 
-            final_prompt = f"""You are an assistant helping AWS learners. Based on the detailed analysis given below and learner feedback, generate a personalized response for the user like the samples attached below and a detailed report for the DRI (directly responsible individual for the AWS course).
+            final_system = "You are an assistant helping AWS learners."
+            final_prompt = f"""Based on the detailed analysis given below and learner feedback, generate a personalized response for the user like the samples attached below and a detailed report for the DRI (directly responsible individual for the AWS course).
 
 # Learner Feedback:
 {st.session_state['feedback_text']}
@@ -3211,20 +3351,22 @@ Lab Instructions Summary:
 2. Report for DRI
 """.strip()
 
-
-            oai = client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[{"role": "system", "content": final_prompt}],
-            )
-            out_text = (oai.choices[0].message.content or "").strip()
+            with st.spinner("Generating learner response and DRI report…"):
+                out_text, _ = call_text_with_fallback(
+                    final_system,
+                    final_prompt,
+                    temperature=0.2,
+                    max_tokens=2048,
+                    openai_model="gpt-4.1",
+                )
             if not out_text:
-                st.error("OpenAI returned an empty response.")
+                st.error("Model returned an empty response.")
                 return
 
             st.session_state["final_feedback_response"] = out_text
 
         except Exception as e:
-            st.error(f"OpenAI generation failed: {e}")
+            st.error(f"Model generation failed: {e}")
             return
 
         # 7) Persist the final output
